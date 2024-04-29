@@ -13,17 +13,21 @@ import os
 os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu_index)[1:-1]
 import torch
 import torch.nn.functional as F
+import llava
+from llava.constants import IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
+from llava.eval.llava_mixtral_eval import create_data_loader, load_pretrained_model
+# from llava.train.train import DataArguments, LazySupervisedDataset
+from llava.model import LlavaQwenForCausalLM
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer,BitsAndBytesConfig
 from datasets import load_dataset
 import json
 from fastchat.model.model_adapter import get_conversation_template
 
-bigname="/home/hongyanz/scratch/weights/llama2chat/13B"
+bigname="/lpai/volumes/cloudmodel-muses/lt/models/llava_qwen4b_sft_v4.5"
 # bigname = "/home/lyh/weights/hf/llama/7B/"
 # smallname = "/home/lyh/weights/hf/llama/7B/"
-
-
+data_file = "/mnt/volumes/cloudmodel-muses/yjiang/data/VLM/03_ExpData/SFT/Release/v0.4.5_yq/driving/drivelm_zh_valid.json"
 
 def longest_common_prefix(list1, list2):
     prefix_length = 0
@@ -43,9 +47,9 @@ def build_dataset_rank(
         tokenizer, split="train",
         select=None,
 ):
-    ds = load_dataset('json', data_files="/home/hongyanz/scratch/data/ShareGPT_V4.3_unfiltered_cleaned_split.json")
+    ds = load_dataset('json', data_files=data_file)
     ds = ds['train']
-    ds = ds.shuffle(seed=42)
+    # ds = ds.shuffle(seed=42)
     ds1 = ds.select(range(args.start, args.end))
     # ds1 = ds.select(range(100,200))
     # dst=ds.select(range(200,300))
@@ -64,7 +68,7 @@ def build_dataset_rank(
             conv = get_conversation_template("llama-2-chat")
             sys_p="You are a helpful, respectful and honest assistant. Always answer as helpfully as possible, while being safe.  Your answers should not include any harmful, unethical, racist, sexist, toxic, dangerous, or illegal content. Please ensure that your responses are socially unbiased and positive in nature.\n\nIf a question does not make any sense, or is not factually coherent, explain why instead of answering something not correct. If you don't know the answer to a question, please don't share false information."
             conv.system_message=sys_p
-            roles = {"human": conv.roles[0], "gpt": conv.roles[1]}
+            roles = {"user": conv.roles[0], "assistant": conv.roles[1]}
             source= examples['conversations'][i]
             if roles[source[0]["from"]] != conv.roles[0]:
                 # Skip the first one if it is not from human
@@ -73,7 +77,7 @@ def build_dataset_rank(
             for j, sentence in enumerate(source):
                 role = roles[sentence["from"]]
                 assert role == conv.roles[j % 2], f"{i}"
-                if sentence["from"]=="gpt":
+                if sentence["from"]=="assistant":
                     sentence["value"]=" "+sentence["value"]
                 conv.append_message(role, sentence["value"])
             conversation=conv.get_prompt()
@@ -94,8 +98,6 @@ def build_dataset_rank(
             #print(i)
 
             sep = conv.sep + conv.roles[1] + " "
-
-
 
             total_len = int(input_ids.ne(tokenizer.pad_token_id).sum())
 
@@ -123,12 +125,11 @@ def build_dataset_rank(
                 cur_len += turn_len
                 cur_len+=2
 
-                if i != 0 and not tokenizer.legacy:
-                    # The legacy and non-legacy modes handle special tokens differently
-                    cur_len -= 1
+                # if i != 0 and not tokenizer.legacy:
+                    # # The legacy and non-legacy modes handle special tokens differently
+                    # cur_len -= 1
 
             loss_mask[cur_len:] = 0
-
 
 
             new_examples["conversation"].append(conversation)
@@ -154,9 +155,9 @@ def build_dataset_rank(
     # dst.set_format(type="torch")
     return ds1
 
-bigtokenizer = AutoTokenizer.from_pretrained(bigname,use_fast=False)
-ds = build_dataset_rank(bigtokenizer)
-print(ds)
+# bigtokenizer = AutoTokenizer.from_pretrained(bigname,use_fast=False)
+# ds = build_dataset_rank(bigtokenizer)
+# print(ds)
 # quantization_config = BitsAndBytesConfig(
 #         load_in_4bit=True,
 #         bnb_4bit_compute_dtype=torch.bfloat16,
@@ -165,29 +166,92 @@ print(ds)
 #     )
 # bigmodel = AutoModelForCausalLM.from_pretrained(bigname, load_in_4bit=True, device_map={"": 0}, )
 # smallmodel = AutoModelForCausalLM.from_pretrained(smallname, load_in_4bit=True, device_map={"": 1}, )
-bigmodel = AutoModelForCausalLM.from_pretrained(bigname,  device_map="auto",torch_dtype=torch.float16)
-#bigmodel = AutoModelForCausalLM.from_pretrained(bigname,  device_map="auto",load_in_8bit=True)
-bigmodel.eval()
+# bigmodel = AutoModelForCausalLM.from_pretrained(bigname,  device_map="auto",torch_dtype=torch.float16)
+# bigmodel = AutoModelForCausalLM.from_pretrained(bigname,  device_map="auto",load_in_8bit=True)
+# bigmodel.eval()
 
 
+with open(data_file, 'r') as f:
+    questions = json.load(f)
+    questions = questions[args.start: args.end]
 
+tokenizer, bigmodel, image_processor, context_len = load_pretrained_model(
+            bigname, model_base="llava_qwen", load_in_8bit=False, load_in_4bit=False)
+ds = create_data_loader(
+    questions,
+    "/mnt/volumes/cloudmodel-muses/llava_data",
+    tokenizer,
+    image_processor,
+    bigmodel.config,
+    batch_size=1
+)
 
-
-
-
-
-
+# for idx,data in enumerate(ds):
+    # input_ids, image_tensor, image_sizes, prompt = data
+    # loss_mask=torch.ones_like(input_ids)
+    # prompt = prompt[0]
+    # print("input_ids:", input_ids)
+    # print("loss_mask:", loss_mask)
+    # print("prompt:", prompt)
+    # for ele in input_ids[0]:
+        # print("prompt decode:", tokenizer.decode(ele))
+    # print("prompt decode:", tokenizer.batch_decode(input_ids))
+    # for chunk in prompt.split('<image>'):
+        # print("chunk:", chunk)   
+        # print(tokenizer(chunk).input_ids)
+    # if idx == 10:
+        # exit()
 
 
 @torch.no_grad()
 def ge(data):
-    input_ids=data["input_ids"]
-    outs_big = bigmodel(input_ids.cuda(), output_hidden_states=True)
+    (input_ids, image_tensor, image_sizes) = data
+
+    input_ids = input_ids.to(device='cuda', non_blocking=True)
+
+    with torch.inference_mode():
+        # output_ids = bigmodel.generate(
+            # input_ids,
+            # images=image_tensor.to(dtype=torch.float16, device='cuda', non_blocking=True),
+            # image_sizes=image_sizes,
+            # do_sample=True if args.temperature > 0 else False,
+            # temperature=args.temperature,
+            # top_p=args.top_p,
+            # num_beams=args.num_beams,
+            # max_new_tokens=args.max_new_tokens,
+            # use_cache=False)
+
+        (
+            inputs,
+            position_ids,
+            attention_mask,
+            _,
+            inputs_embeds,
+            _
+        ) = bigmodel.prepare_inputs_labels_for_multimodal(
+            input_ids,
+            None,
+            None,
+            None,
+            None,
+            image_tensor.to(dtype=torch.float16, device='cuda', non_blocking=True),
+            image_sizes=image_sizes
+        )
+
+        outs_big = bigmodel(
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            inputs_embeds=inputs_embeds,
+            output_hidden_states=True
+        )
+        loss_mask=torch.zeros(inputs_embeds.shape[0],inputs_embeds.shape[1])
+
+    # outs_big = bigmodel(input_ids.cuda(), output_hidden_states=True)
     hidden_state_big = outs_big.hidden_states[-1]
     max_prob_tokens_big = torch.argmax(outs_big.logits, dim=-1)
     probs = torch.softmax(outs_big.logits, dim=-1)
     maxp=probs[0].max(dim=1).values
-    td={"input_ids":input_ids.cpu()[0],"hidden_state":hidden_state_big.cpu()[0],"loss_mask":data["loss_mask"].cpu()[0]}
+    td={"input_ids":input_ids.cpu()[0],"inputs_embeds":inputs_embeds.cpu()[0],"hidden_state":hidden_state_big.cpu()[0],"loss_mask":loss_mask.cpu()[0]}
     return td
 
 outdir = f'{args.outdir}/{args.index}'

@@ -1226,7 +1226,7 @@ def forward_with_tree_mask(
         (batch_size, seq_length),
         inputs_embeds,
         past_key_values_length,
-    )
+    ).bool()
 
     hidden_states = inputs_embeds
     next_decoder_cache = ()

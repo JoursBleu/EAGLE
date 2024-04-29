@@ -616,6 +616,7 @@ class Model(nn.Module):
                     hidden_states,
                     attention_mask,
                     position_ids,
+                    use_reentrant=True,
                 )
             else:
                 layer_outputs = decoder_layer(

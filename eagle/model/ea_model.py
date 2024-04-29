@@ -81,7 +81,7 @@ class EaModel(nn.Module):
     ):
         #assert Type=="LLaMA" or "Mixtral"
         Type=AutoConfig.from_pretrained(base_model_path).architectures[0]
-        if Type=='LlamaForCausalLM':
+        if Type=='LlamaForCausalLM' or True:
             base_model = KVLlamaForCausalLM.from_pretrained(
                 base_model_path, **kwargs
             )
@@ -162,6 +162,7 @@ class EaModel(nn.Module):
             tree_choices=mc_sim_7b_63,
 
     ):
+        total_accept_length = 0
         if temperature > 1e-5:
             logits_processor = prepare_logits_processor(temperature=temperature, top_p=top_p, top_k=top_k)
         else:
@@ -243,13 +244,17 @@ class EaModel(nn.Module):
                 hidden_state_new,
                 sample_p
             )
+            total_accept_length += accept_length
+            # print("candidates", candidates)
+            # print("accept_length", accept_length)
+            # print("batch_decode", self.tokenizer.batch_decode(candidates.reshape(5,1), skip_special_tokens=True))
 
             if self.tokenizer.eos_token_id in input_ids[0, input_len:].tolist():
-                return input_ids
+                return input_ids, total_accept_length / (idx+1.)
             if new_token > max_new_tokens:
-                return input_ids
+                return input_ids, total_accept_length / (idx+1.)
             if input_ids.shape[1] > max_length:
-                return input_ids
+                return input_ids, total_accept_length / (idx+1.)
 
     @torch.no_grad()
     def ea_generate(
