@@ -24,7 +24,8 @@ from datasets import load_dataset
 import json
 from fastchat.model.model_adapter import get_conversation_template
 
-bigname="/lpai/volumes/cloudmodel-muses/lt/models/llava_qwen4b_sft_v4.5"
+# bigname="/lpai/volumes/cloudmodel-muses/lt/models/llava_qwen4b_sft_v4.5"
+bigname="/mnt/volumes/cloudmodel-muses/lt/models/wdf-llava-pretrain-ckpts-24-04-28-01"
 # bigname = "/home/lyh/weights/hf/llama/7B/"
 # smallname = "/home/lyh/weights/hf/llama/7B/"
 data_file = "/mnt/volumes/cloudmodel-muses/yjiang/data/VLM/03_ExpData/SFT/Release/v0.4.5_yq/driving/drivelm_zh_valid.json"
@@ -205,7 +206,7 @@ ds = create_data_loader(
 
 @torch.no_grad()
 def ge(data):
-    (input_ids, image_tensor, image_sizes) = data
+    (input_ids, image_tensor, image_sizes, prompt) = data
 
     input_ids = input_ids.to(device='cuda', non_blocking=True)
 
@@ -244,8 +245,19 @@ def ge(data):
             inputs_embeds=inputs_embeds,
             output_hidden_states=True
         )
-        loss_mask=torch.zeros(inputs_embeds.shape[0],inputs_embeds.shape[1])
 
+    image_len = inputs_embeds.shape[1] - input_ids.shape[1]
+    loss_mask=torch.zeros(inputs_embeds.shape[0],inputs_embeds.shape[1])
+    mask = 0
+    for idx in range(input_ids[0].numel()):
+        loss_mask[0][image_len+idx] = mask
+        if (input_ids[0][idx] == 60):
+            if (input_ids[0][idx-1] == 64462):
+                if (input_ids[0][idx-2] == 64928):
+                    mask = 1
+        if (mask == 1) and (input_ids[0][idx] == 151643):
+            mask = 0
+        
     # outs_big = bigmodel(input_ids.cuda(), output_hidden_states=True)
     hidden_state_big = outs_big.hidden_states[-1]
     max_prob_tokens_big = torch.argmax(outs_big.logits, dim=-1)

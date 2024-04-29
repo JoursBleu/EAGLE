@@ -540,7 +540,7 @@ class Model(nn.Module):
     def forward(
         self,
         hidden_states,
-        input_ids,
+        input_ids=None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[List[torch.FloatTensor]] = None,
@@ -555,9 +555,10 @@ class Model(nn.Module):
         seq_length_with_past = seq_length
         past_key_values_length = 0
 
-        with torch.no_grad():
-            inputs_embeds = self.embed_tokens(input_ids)
-            #inputs_embeds = inputs_embeds.detach()
+        if input_ids is not None:
+            with torch.no_grad():
+                inputs_embeds = self.embed_tokens(input_ids)
+                #inputs_embeds = inputs_embeds.detach()
 
         # if std is not None:
         #     noise = torch.randn(inputs_embeds.size(),device=inputs_embeds.device) * std

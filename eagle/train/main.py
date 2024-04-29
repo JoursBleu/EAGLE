@@ -148,7 +148,7 @@ class CustomDataset(Dataset):
         data = torch.load(self.data[index])
         new_data = {}
         hidden_state = data['hidden_state'][:train_config["max_len"]][None, :]
-        # input_ids = data['input_ids'][:train_config["max_len"]][None, :]
+        input_ids = data['input_ids'][:train_config["max_len"]][None, :]
         inputs_embeds = data['inputs_embeds'][:train_config["max_len"]][None, :]
         loss_mask = data["loss_mask"][:train_config["max_len"]][None, :]
 
@@ -163,17 +163,15 @@ class CustomDataset(Dataset):
         loss_mask = loss_mask[0].tolist()
         loss_mask[-1] = 0
 
-        # input_ids_target = input_ids[:, 1:]
+        input_ids_target = input_ids[:, 1:]
         inputs_embeds_target = inputs_embeds[:, 1:]
         zeropadding = torch.tensor([[tokenizer.pad_token_id]])
         padding_embedding = bigmodel.model.embed_tokens(zeropadding)
-        # input_ids_target = torch.cat((input_ids_target, zeropadding), dim=1)
-        print("1 inputs_embeds_target", inputs_embeds_target)
+        input_ids_target = torch.cat((input_ids_target, zeropadding), dim=1)
         inputs_embeds_target = torch.cat((inputs_embeds_target, padding_embedding), dim=1)
-        print("2 inputs_embeds_target", inputs_embeds_target)
 
         target = hidden_state[:, 1:, :]
-        zeropadding = torch.tensor([[tokenizer.pad_token_id]])
+        zeropadding = torch.tensor([[0.]])
         zeropadding = zeropadding.expand(1, 1, target.shape[2])
         target = torch.cat((target, zeropadding), dim=1)
         loss_mask[-1] = 0
@@ -181,15 +179,14 @@ class CustomDataset(Dataset):
         new_data["loss_mask"] = loss_mask
         new_data["target"] = target
         new_data["hidden_state_big"] = hidden_state
-        # new_data["input_ids"] = input_ids_target
-        new_data["inputs_embeds"] = inputs_embeds_target
+        new_data["input_ids"] = input_ids_target
+        new_data["inputs_embeds"] = inputs_embeds_target.detach()
         # sample = torch.cat((data['xs'],data['xb']))
         # sample=torch.cat((self.data[index]['x'],self.data[index]['logits']))
         # label = data['y']
 
         if self.transform:
             new_data = self.transform(new_data)
-        print("new_data", new_data)
         return new_data
 
 zeropadding = torch.tensor([[tokenizer.pad_token_id]])
@@ -199,21 +196,34 @@ class DataCollatorWithPadding:
 
     def paddingtensor(self, intensors, N):
         B, n, S = intensors.shape
-        # padding_tensor = torch.zeros(B, N - n, S,dtype=intensors.dtype)
-        padding_tensor = torch.zeros(B, N - n, S)
-        outtensors = torch.cat((intensors, padding_tensor), dim=1)
+        outtensors = intensors
+        if (n < N):
+            # padding_tensor = torch.zeros(B, N - n, S,dtype=intensors.dtype)
+            padding_tensor = torch.zeros(B, N - n, S)
+            outtensors = torch.cat((intensors, padding_tensor), dim=1)
         return outtensors
 
     def paddingtensor2D(self, intensors, N):
         B, n, H = intensors.shape
-        # padding_tensor = torch.zeros(B, N - n, dtype=intensors.dtype)
-        padding_embedding.expand(B, N - n, H)
-        outtensors = torch.cat((intensors, padding_embedding), dim=1)
+        outtensors = intensors
+        if (n < N):
+            # padding_tensor = torch.zeros(B, N - n, dtype=intensors.dtype)
+            padding_embedding.expand(B, N - n, H)
+            outtensors = torch.cat((intensors, padding_embedding), dim=1)
+        return outtensors
+
+    def paddingtensor2D_id(self, intensors, N):
+        B, n = intensors.shape
+        outtensors = intensors
+        if (n < N):
+            padding_tensor = torch.zeros(B, N - n, dtype=intensors.dtype)
+            outtensors = torch.cat((intensors, padding_tensor), dim=1)
         return outtensors
 
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, Any]:
         max_length = max(item['hidden_state_big'].shape[1] for item in features)
         batch_inputs_embeds = torch.cat([self.paddingtensor2D(item['inputs_embeds'], max_length) for item in features])
+        input_ids = torch.cat([self.paddingtensor2D_id(item['input_ids'], max_length) for item in features])
         batch_hidden_states = torch.cat([self.paddingtensor(item['hidden_state_big'], max_length) for item in features])
         batch_target = torch.cat([self.paddingtensor(item['target'], max_length) for item in features])
         batch_loss_mask = torch.tensor(
@@ -223,13 +233,13 @@ class DataCollatorWithPadding:
         # batch_loss_mask = torch.ones_like(batch_loss_mask)
         # batch_attention_mask=torch.ones_like(batch_attention_mask)
         batch = {
-            "inputs_embeds": batch_inputs_embeds,
+            "input_ids": input_ids,
+            "inputs_embeds": batch_inputs_embeds.detach(),
             "hidden_states": batch_hidden_states,
             "target": batch_target,
             "attention_mask": batch_attention_mask,
             "loss_mask": batch_loss_mask,
         }
-        print("batch", batch)
         return batch
 
 
@@ -255,6 +265,7 @@ def top_accuracy(output, target, topk=(1,)):
 def getkacc(model, data, head, max_length=5):
     hidden_states = data["hidden_states"]
     input_ids = data["input_ids"]
+    inputs_embeds = data["inputs_embeds"]
     # attention_mask=data["attention_mask"]
     loss_mask = data["loss_mask"]
     # sample_mask=data["sample_mask"]
@@ -269,10 +280,12 @@ def getkacc(model, data, head, max_length=5):
         for j in range(sl):
 
             single_hidden_states = hidden_states[i, :j]
-            single_input_ids = input_ids[i, :j]
+            # single_input_ids = input_ids[i, :j]
+            single_inputs_embeds = inputs_embeds[i, :j]
 
             single_hidden_states = single_hidden_states[None, :, :]
-            single_input_ids = single_input_ids[None, :]
+            # single_input_ids = single_input_ids[None, :]
+            single_inputs_embeds = single_inputs_embeds[None, :]
             for k in range(max_length):
                 if loss_mask[i, single_hidden_states.shape[1] - 1] == 0:
                     break
@@ -280,11 +293,11 @@ def getkacc(model, data, head, max_length=5):
                 tmp_out_target_headout = target_headout[i, single_hidden_states.shape[1] - 1]
                 target_in_token = torch.argmax(tmp_in_target_headout)
                 target_out_token = torch.argmax(tmp_out_target_headout)
-                tmp_token = input_ids[i, single_hidden_states.shape[1] - 1]
+                tmp_token = input_ids[i, single_hidden_states.shape[1] - 1 - 575]
                 # tmp_sample_mask=sample_mask[i,single_hidden_states.shape[1]-1]
                 if not (target_in_token == tmp_token):
                     break
-                out_hidden = model(single_hidden_states, input_ids=single_input_ids)
+                out_hidden = model(single_hidden_states, inputs_embeds=single_inputs_embeds)
                 last_hidden = out_hidden[:, -1]
                 last_headout = head(last_hidden)
                 token = torch.argmax(last_headout)
@@ -297,8 +310,10 @@ def getkacc(model, data, head, max_length=5):
                     break
 
                 single_hidden_states = torch.cat((single_hidden_states, out_hidden[:, -1:]), dim=1)
-                single_input_ids = torch.cat((single_input_ids, torch.tensor([[token]]).to(single_input_ids.device)),
-                                             dim=1)
+                new_embedding = model.embed_tokens(torch.tensor([[token]]).to(single_inputs_embeds.device))
+                # single_input_ids = torch.cat((single_input_ids, torch.tensor([[token]]).to(single_input_ids.device)),
+                                             # dim=1)
+                single_inputs_embeds = torch.cat((single_inputs_embeds, new_embedding), dim=1)
 
     acc = [correct[i] / max_length for i in range(len(correct))]
     return acc
@@ -364,12 +379,10 @@ for epoch in range(num_epochs + 1):
     num_batches = 0
     model.train()
     for batch_idx, data in enumerate(tqdm(train_loader)):
-        print("batch_idx", batch_idx, "data", data)
 
         with accelerator.accumulate(model):
             optimizer.zero_grad()
-            predict = model(data["hidden_states"], inputs_embeds=data["inputs_embeds"], attention_mask=data["attention_mask"])
-            print("predict", predict)
+            predict = model(hidden_states=data["hidden_states"], inputs_embeds=data["inputs_embeds"], attention_mask=data["attention_mask"])
             with torch.no_grad():
                 target_head = head(data["target"])
                 target_p = nn.Softmax(dim=2)(target_head)
@@ -454,7 +467,7 @@ for epoch in range(num_epochs + 1):
                     acces = getkacc(model, data, head, max_length=5)
                     for i in range(len(acces)):
                         k_acc[i].append(acces[i])
-                predict = model(data["hidden_states"], input_ids=data["input_ids"],
+                predict = model(data["hidden_states"], inputs_embeds=data["inputs_embeds"],
                                 attention_mask=data["attention_mask"])
                 target_head = head(data["target"])
                 target_p = nn.Softmax(dim=2)(target_head)
