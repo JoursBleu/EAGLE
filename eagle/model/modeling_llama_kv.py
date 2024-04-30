@@ -27,6 +27,7 @@ from transformers.utils import (
     replace_return_docstrings,
 )
 from transformers import LlamaConfig
+from transformers.models.qwen2.modeling_qwen2 import Qwen2RotaryEmbedding
 
 logger = logging.get_logger(__name__)
 
@@ -472,6 +473,7 @@ class LlamaAttention(nn.Module):
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.pretraining_tp = config.pretraining_tp
         self.max_position_embeddings = config.max_position_embeddings
+        self.rope_theta = config.rope_theta
 
         if (self.head_dim * self.num_heads) != self.hidden_size:
             raise ValueError(
@@ -479,13 +481,13 @@ class LlamaAttention(nn.Module):
                 f" and `num_heads`: {self.num_heads})."
             )
         self.q_proj = nn.Linear(
-            self.hidden_size, self.num_heads * self.head_dim, bias=False
+            self.hidden_size, self.num_heads * self.head_dim, bias=True
         )
         self.k_proj = nn.Linear(
-            self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False
+            self.hidden_size, self.num_key_value_heads * self.head_dim, bias=True
         )
         self.v_proj = nn.Linear(
-            self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False
+            self.hidden_size, self.num_key_value_heads * self.head_dim, bias=True
         )
         self.o_proj = nn.Linear(
             self.num_heads * self.head_dim, self.hidden_size, bias=False
@@ -493,6 +495,12 @@ class LlamaAttention(nn.Module):
         self._init_rope()
 
     def _init_rope(self):
+        self.rotary_emb = Qwen2RotaryEmbedding(
+            self.head_dim,
+            max_position_embeddings=self.max_position_embeddings,
+            base=self.rope_theta,
+        )
+        return
         if self.config.rope_scaling is None:
             self.rotary_emb = LlamaRotaryEmbedding(
                 self.head_dim, max_position_embeddings=self.max_position_embeddings

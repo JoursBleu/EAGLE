@@ -7,15 +7,17 @@ parser.add_argument('--end', type=int, default=100)
 parser.add_argument('--index', type=int, default=1)
 parser.add_argument('--gpu_index', type=int, nargs='+', default=[0])
 parser.add_argument('--outdir', type=str, default='outdir0')
+parser.add_argument('--data_file', type=str, default="/mnt/volumes/cloudmodel-muses/yjiang/data/VLM/03_ExpData/SFT/Release/v0.4.5_yq/driving/drivelm_zh_valid.json")
 args = parser.parse_args()
 import os
 
 os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu_index)[1:-1]
 import torch
 import torch.nn.functional as F
-import llava
-from llava.constants import IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
-from llava.eval.llava_mixtral_eval import create_data_loader, load_pretrained_model
+import mind_ad
+from mind_ad.constants import IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
+from mind_ad.model.builder import load_pretrained_model
+from mind_ad.eval.eval_llava import create_data_loader
 # from llava.train.train import DataArguments, LazySupervisedDataset
 from llava.model import LlavaQwenForCausalLM
 from tqdm import tqdm
@@ -28,7 +30,7 @@ from fastchat.model.model_adapter import get_conversation_template
 bigname="/mnt/volumes/cloudmodel-muses/lt/models/wdf-llava-pretrain-ckpts-24-04-28-01"
 # bigname = "/home/lyh/weights/hf/llama/7B/"
 # smallname = "/home/lyh/weights/hf/llama/7B/"
-data_file = "/mnt/volumes/cloudmodel-muses/yjiang/data/VLM/03_ExpData/SFT/Release/v0.4.5_yq/driving/drivelm_zh_valid.json"
+data_file = args.data_file
 
 def longest_common_prefix(list1, list2):
     prefix_length = 0
@@ -174,16 +176,21 @@ def build_dataset_rank(
 
 with open(data_file, 'r') as f:
     questions = json.load(f)
-    questions = questions[args.start: args.end]
+    length = len(questions)
+    start = 0
+    end = int(length*0.95 - 1)
+    questions = questions[start: end]
 
 tokenizer, bigmodel, image_processor, context_len = load_pretrained_model(
-            bigname, model_base="llava_qwen", load_in_8bit=False, load_in_4bit=False)
+            bigname, model_base="llava_qwen", device_map="cuda", load_in_8bit=False, load_in_4bit=False)
 ds = create_data_loader(
     questions,
     "/mnt/volumes/cloudmodel-muses/llava_data",
     tokenizer,
     image_processor,
     bigmodel.config,
+    conv_mode="qwen_instruct",
+    padding_side="right",
     batch_size=1
 )
 
@@ -278,11 +285,7 @@ def writedata(name,data_point):
     torch.save(data_point, f'{name}/data_{idx}.ckpt')
 
 
-for id,data in enumerate(ds):
-    if id%100==0:
-        print(id,end="\t")
-    if id % 1000 == 0:
-        print("")
+for id,data in enumerate(tqdm(ds)):
     outdata = ge(data)
     writedata(outdir,outdata)
 

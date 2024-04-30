@@ -66,11 +66,6 @@ from tqdm import tqdm
 import numpy as np
 from transformers import get_linear_schedule_with_warmup, AutoConfig
 
-if accelerator.is_main_process:
-    import wandb
-
-    wandb.init(project="ess", entity="yuhui-li", config=train_config)
-
 baseconfig = AutoConfig.from_pretrained(args.basepath)
 tokenizer = AutoTokenizer.from_pretrained(args.basepath, use_fast=False)
 # bigmodel = AutoModelForCausalLM.from_pretrained(args.basepath, device_map="cpu")
@@ -434,9 +429,7 @@ for epoch in range(num_epochs + 1):
                        "train/ploss": ploss.item(), "train/loss": loss.item(), "train/acc": cc / ct}
             for id, i in enumerate(top_3acc):
                 logdict[f'train/top_{id + 1}_acc'] = topkacc[id].item() / ct
-            wandb.log(logdict)
-            # for id,i in enumerate(top_3acc):
-            #     wandb.log({f'train/top_{id+1}_acc':topkacc[id].item()/ct})
+
 
         del ploss, vloss
         epoch_loss += loss.item()
@@ -447,13 +440,10 @@ for epoch in range(num_epochs + 1):
     correct, total = correct.sum().item(), total.sum().item()
     epoch_loss /= num_batches
     top_3acc = accelerator.gather_for_metrics(top_3acc)
-    if accelerator.is_local_main_process:
-        for id, i in enumerate(top_3acc):
-            wandb.log({f'train/epochtop_{id + 1}_acc': i.sum().item() / total})
+
     if accelerator.is_local_main_process:
         print('Epoch [{}/{}], Loss: {:.4f}'.format(epoch + 1, num_epochs, epoch_loss))
         print('Train Accuracy: {:.2f}%'.format(100 * correct / total))
-        wandb.log({"train/epochacc": correct / total, "train/epochloss": epoch_loss})
 
     if (epoch + 1) % train_config["save_freq"]:
         top_3acc = [0 for _ in range(3)]
@@ -507,20 +497,16 @@ for epoch in range(num_epochs + 1):
         if accelerator.is_local_main_process:
             for id, i in enumerate(mean_acces):
                 mean_acc = i.mean().item()
-                wandb.log({f"test/{id}_acc": mean_acc})
 
         correct, total = torch.tensor(correct).cuda(), torch.tensor(total).cuda()
         correct, total = accelerator.gather_for_metrics((correct, total))
         correct, total = correct.sum().item(), total.sum().item()
         top_3acc = accelerator.gather_for_metrics(top_3acc)
-        if accelerator.is_local_main_process:
-            for id, i in enumerate(top_3acc):
-                wandb.log({f'test/top_{id + 1}_acc': i.sum().item() / total})
+
         epoch_loss /= num_batches
         if accelerator.is_local_main_process:
             print('Test Epoch [{}/{}], Loss: {:.4f}'.format(epoch + 1, num_epochs, epoch_loss))
             print('Test Accuracy: {:.2f}%'.format(100 * correct / total))
-            wandb.log({"test/epochacc": correct / total, "test/epochloss": epoch_loss})
             accelerator.save_model(model, f"checkpoints/model_{epoch}", safe_serialization=False)
             # accelerator.save_state(output_dir=f"{args.outdir}/state_{epoch}")
             # os.system(f"cp -r {args.outdir} {args.cpdir}")

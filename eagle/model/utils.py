@@ -227,9 +227,9 @@ def generate_tree_buffers(tree_choices, device="cuda"):
     return tree_buffers
 
 
-def initialize_tree(input_ids, model, tree_attn_mask, past_key_values, logits_processor):
+def initialize_tree(inputs_embeds, model, tree_attn_mask, past_key_values, logits_processor):
     tree_logits, outputs, logits, hidden_state, sample_token = model(
-        input_ids, past_key_values=past_key_values, output_orig=True, logits_processor=logits_processor
+        inputs_embeds=inputs_embeds, past_key_values=past_key_values, output_orig=True, logits_processor=logits_processor
     )
     model.base_model.model.tree_mask = tree_attn_mask
     return tree_logits, logits, hidden_state, sample_token
@@ -300,13 +300,13 @@ def tree_decoding(
         tree_candidates,
         past_key_values,
         tree_position_ids,
-        input_ids,
+        inputs_embeds,
         retrieve_indices,
 ):
-    position_ids = tree_position_ids + input_ids.shape[1]
+    position_ids = tree_position_ids + inputs_embeds.shape[1]
 
     outputs, tree_logits, hidden_state = model(
-        tree_candidates,
+        input_ids=tree_candidates,
         output_orig=True,
         past_key_values=past_key_values,
         position_ids=position_ids,
@@ -415,6 +415,7 @@ def evaluate_posterior(
 @torch.no_grad()
 def update_inference_inputs(
         input_ids,
+        inputs_embeds,
         candidates,
         best_candidate,
         accept_length,
@@ -430,15 +431,21 @@ def update_inference_inputs(
         hidden_state_new,
         sample_p
 ):
-    prev_input_len = input_ids.shape[1]
+    prev_input_len = inputs_embeds.shape[1]
     # Map the best candidate indices to the original indices in the sequence
     select_indices = (
             retrieve_indices[best_candidate, : accept_length + 1] + prev_input_len
     )
     # Append the tokens from the best candidate to the input sequence
+    # print("input_ids:", input_ids)
+    # print("candidates[None, best_candidate, : accept_length + 1]:", candidates[None, best_candidate, : accept_length + 1])
     input_ids = torch.cat(
         [input_ids, candidates[None, best_candidate, : accept_length + 1].to(input_ids.device)], dim=-1
     )
+    # print("input_ids after:", input_ids)
+    new_embedding = model.base_model.model.embed_tokens(
+                        candidates[None, best_candidate, : accept_length + 1].to(inputs_embeds.device))
+    inputs_embeds = torch.cat([inputs_embeds, new_embedding], dim=1)
     # Update the past key values based on the selected tokens
     # Source tensor that contains relevant past information based on the selected candidate
     for past_key_values_data in past_key_values_data_list:
@@ -463,13 +470,17 @@ def update_inference_inputs(
         token = torch.argmax(prob)
         token = token[None, None]
     # hidden_state = torch.cat((hidden_state, accept_hidden_state_new), dim=1)
+    new_embedding = model.base_model.model.embed_tokens(token.to(inputs_embeds.device))
     tree_logits = model.ea_layer.topK_genrate(accept_hidden_state_new,
-                                              input_ids=torch.cat((input_ids, token.to(input_ids.device)), dim=1),
+                                              inputs_embeds=torch.cat((inputs_embeds, new_embedding), dim=1),
                                               head=model.base_model.lm_head, logits_processor=logits_processor)
+    # tree_logits = model.ea_layer.topK_genrate(accept_hidden_state_new,
+                                              # input_ids=torch.cat((input_ids, token.to(input_ids.device)), dim=1),
+                                              # head=model.base_model.lm_head, logits_processor=logits_processor)
 
     new_token += accept_length + 1
 
-    return input_ids, tree_logits, new_token, None, token
+    return input_ids, inputs_embeds, tree_logits, new_token, None, token
 
 
 if __name__ == "__main__":

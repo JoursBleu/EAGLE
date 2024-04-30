@@ -3,6 +3,7 @@ import copy
 
 parser = argparse.ArgumentParser(description='sp')
 parser.add_argument('--outdir', type=str, default='0')
+parser.add_argument('--data_file', type=str, default="/mnt/volumes/cloudmodel-muses/yjiang/data/VLM/03_ExpData/SFT/Release/v0.4.5_yq/driving/drivelm_zh_valid.json")
 args = parser.parse_args()
 
 import os
@@ -58,8 +59,8 @@ for i in range(num_p):
     gpu_index = gpus[i]
     gpu_index_str = ' '.join(map(str, gpu_index))
     # gpu_index_str='['+gpu_index_str+']'
-    command = "python ge_data_all_llama2chat.py --start={} --end={} --index={} --gpu_index {} --outdir {}".format(start, end, index,
-                                                                                                gpu_index_str, outdir)
+    command = "python ge_data_all_llama2chat.py --index={} --gpu_index {} --outdir {} --data_file {}".format(index,
+                                                                                        gpu_index_str, outdir, args.data_file)
     commands.append(command)
 # run_command(commands[0])
 # commands=commands[:1]

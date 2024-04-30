@@ -761,22 +761,22 @@ class Model(nn.Module):
         #     return sampled_indices, sampled_probs
 
     @torch.no_grad()
-    def topK_genrate(self, hidden_states, input_ids, head, logits_processor,max_length=4, use_cache=True):
+    def topK_genrate(self, hidden_states, inputs_embeds, head, logits_processor,max_length=4, use_cache=True):
         # test_=input_ids
         # input_ids = torch.tensor([state[1:]])
-        input_ids = input_ids[:, 1:]
-        input_ids = input_ids.to(hidden_states.device)
+        inputs_embeds = inputs_embeds[:, 1:, :]
+        inputs_embeds = inputs_embeds.to(hidden_states.device)
         ss_token,ss_prob,ss_op = [],[],[]
-        len_posi=input_ids.shape[1]
+        len_posi=inputs_embeds.shape[1]
         self.reset()
         if use_cache:
 
 
             if hasattr(self, "stable_kv") and self.stable_kv is not None:
                 kv_len=self.stable_kv[0][0].shape[2]
-                out_hidden, past_key_values = self(hidden_states, input_ids=input_ids[:,kv_len:], past_key_values=self.stable_kv,use_cache=True)
+                out_hidden, past_key_values = self(hidden_states, inputs_embeds=inputs_embeds[:,kv_len:, :], past_key_values=self.stable_kv,use_cache=True)
             else:
-                out_hidden, past_key_values = self(hidden_states, input_ids=input_ids, use_cache=True)
+                out_hidden, past_key_values = self(hidden_states, inputs_embeds=inputs_embeds, use_cache=True)
             self.stable_kv=past_key_values
             last_hidden = out_hidden[:, -1]
             if not self.diff_device:
