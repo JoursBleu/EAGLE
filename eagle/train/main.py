@@ -73,7 +73,10 @@ if accelerator.is_main_process:
 
 baseconfig = AutoConfig.from_pretrained(args.basepath)
 tokenizer = AutoTokenizer.from_pretrained(args.basepath, use_fast=False)
-bigmodel = AutoModelForCausalLM.from_pretrained(args.basepath, device_map="cpu")
+# bigmodel = AutoModelForCausalLM.from_pretrained(args.basepath, device_map="cpu")
+
+config = EConfig.from_pretrained(train_config["config_path"])
+model = Model(config, load_emb=True, path=args.basepath)
 
 head = torch.nn.Linear(baseconfig.hidden_size, baseconfig.vocab_size, bias=False)
 
@@ -134,16 +137,22 @@ class AddUniformNoise:
         data["hidden_state_big"] = noisy_tensor
         return data
 
+zeropadding = torch.tensor([[tokenizer.pad_token_id]])
+padding_embedding = model.embed_tokens(zeropadding)
 
 class CustomDataset(Dataset):
-    def __init__(self, datapath, transform=None):
+    def __init__(self, datapath, zeropadding, padding_embedding, transform=None):
         self.data = datapath
         self.transform = transform
+        self.zeropadding = zeropadding
+        self.padding_embedding = padding_embedding
 
     def __len__(self):
         return len(self.data)
 
     def __getitem__(self, index):
+        zeropadding = self.zeropadding
+        padding_embedding = self.padding_embedding
         # try:
         data = torch.load(self.data[index])
         new_data = {}
@@ -165,8 +174,8 @@ class CustomDataset(Dataset):
 
         input_ids_target = input_ids[:, 1:]
         inputs_embeds_target = inputs_embeds[:, 1:]
-        zeropadding = torch.tensor([[tokenizer.pad_token_id]])
-        padding_embedding = bigmodel.model.embed_tokens(zeropadding)
+        # zeropadding = torch.tensor([[tokenizer.pad_token_id]])
+        # padding_embedding = model.module.embed_tokens(zeropadding)
         input_ids_target = torch.cat((input_ids_target, zeropadding), dim=1)
         inputs_embeds_target = torch.cat((inputs_embeds_target, padding_embedding), dim=1)
 
@@ -188,9 +197,6 @@ class CustomDataset(Dataset):
         if self.transform:
             new_data = self.transform(new_data)
         return new_data
-
-zeropadding = torch.tensor([[tokenizer.pad_token_id]])
-padding_embedding = bigmodel.model.embed_tokens(zeropadding)
 
 class DataCollatorWithPadding:
 
@@ -310,7 +316,7 @@ def getkacc(model, data, head, max_length=5):
                     break
 
                 single_hidden_states = torch.cat((single_hidden_states, out_hidden[:, -1:]), dim=1)
-                new_embedding = model.embed_tokens(torch.tensor([[token]]).to(single_inputs_embeds.device))
+                new_embedding = model.module.embed_tokens(torch.tensor([[token]]).to(single_inputs_embeds.device))
                 # single_input_ids = torch.cat((single_input_ids, torch.tensor([[token]]).to(single_input_ids.device)),
                                              # dim=1)
                 single_inputs_embeds = torch.cat((single_inputs_embeds, new_embedding), dim=1)
@@ -334,8 +340,8 @@ testdatapath = datapath[int(len(datapath) * 0.95):]
 # print('td',train_config["datapath"])
 # print(datapath)
 # exit()
-traindataset = CustomDataset(traindatapath, transform=aug)
-testdataset = CustomDataset(testdatapath)
+traindataset = CustomDataset(traindatapath, zeropadding, padding_embedding, transform=aug)
+testdataset = CustomDataset(testdatapath, zeropadding, padding_embedding)
 train_loader = DataLoader(traindataset, batch_size=train_config["bs"], shuffle=True,
                           collate_fn=DataCollatorWithPadding(), num_workers=train_config["num_workers"],
                           pin_memory=True)
@@ -347,9 +353,6 @@ test_loader = DataLoader(testdataset, batch_size=train_config["bs"], shuffle=Fal
 if accelerator.is_main_process:
     if not os.path.exists(args.cpdir):
         os.makedirs(args.cpdir)
-
-config = EConfig.from_pretrained(train_config["config_path"])
-model = Model(config, load_emb=True, path=args.basepath)
 
 criterion = nn.SmoothL1Loss(reduction="none")
 optimizer = optim.AdamW(model.parameters(), lr=train_config["lr"], betas=(train_config["b1"], train_config["b2"]))
@@ -521,4 +524,4 @@ for epoch in range(num_epochs + 1):
             accelerator.save_model(model, f"checkpoints/model_{epoch}", safe_serialization=False)
             # accelerator.save_state(output_dir=f"{args.outdir}/state_{epoch}")
             # os.system(f"cp -r {args.outdir} {args.cpdir}")
-            accelerator.save_state(output_dir=f"{args.cpdir}/state_{epoch}")
+            # accelerator.save_state(output_dir=f"{args.cpdir}/state_{epoch}")
