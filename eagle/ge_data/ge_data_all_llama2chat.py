@@ -5,13 +5,14 @@ parser = argparse.ArgumentParser(description='sp')
 parser.add_argument('--start', type=int, default=0)
 parser.add_argument('--end', type=int, default=100)
 parser.add_argument('--index', type=int, default=1)
-parser.add_argument('--gpu_index', type=int, nargs='+', default=[0])
+parser.add_argument('--gpu_index', type=int, default=0)
+parser.add_argument('--gpu_num', type=int, default=1)
 parser.add_argument('--outdir', type=str, default='outdir0')
 parser.add_argument('--data_file', type=str, default="/mnt/volumes/cloudmodel-muses/yjiang/data/VLM/03_ExpData/SFT/Release/v0.4.5_yq/driving/drivelm_zh_valid.json")
 args = parser.parse_args()
 import os
 
-os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu_index)[1:-1]
+os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu_index)
 import torch
 import torch.nn.functional as F
 import mind_ad
@@ -27,7 +28,7 @@ import json
 from fastchat.model.model_adapter import get_conversation_template
 
 # bigname="/lpai/volumes/cloudmodel-muses/lt/models/llava_qwen4b_sft_v4.5"
-bigname="/mnt/volumes/cloudmodel-muses/lt/models/wdf-llava-pretrain-ckpts-24-04-28-01"
+bigname="/mnt/volumes/cloudmodel-muses/lt/models/wdf-llava-pretrain-ckpts-24-05-03-02"
 # bigname = "/home/lyh/weights/hf/llama/7B/"
 # smallname = "/home/lyh/weights/hf/llama/7B/"
 data_file = args.data_file
@@ -177,15 +178,18 @@ def build_dataset_rank(
 with open(data_file, 'r') as f:
     questions = json.load(f)
     length = len(questions)
-    start = 0
-    end = int(length*0.95 - 1)
+    length = length if length < 60000 else 60000
+    start = int((length-1.) * float(args.gpu_index) / args.gpu_num)
+    end = int((length-1.) * (args.gpu_index+1.) / args.gpu_num)
     questions = questions[start: end]
+
+print("start", start, "end", end)
 
 tokenizer, bigmodel, image_processor, context_len = load_pretrained_model(
             bigname, model_base="llava_qwen", device_map="cuda", load_in_8bit=False, load_in_4bit=False)
 ds = create_data_loader(
     questions,
-    "/mnt/volumes/cloudmodel-muses/llava_data",
+    "/lpai/volumes/cloudmodel-muses/llava_data",
     tokenizer,
     image_processor,
     bigmodel.config,
@@ -286,7 +290,10 @@ def writedata(name,data_point):
 
 
 for id,data in enumerate(tqdm(ds)):
-    outdata = ge(data)
+    try:
+        outdata = ge(data)
+    except IndexError:
+        continue
     writedata(outdir,outdata)
 
 

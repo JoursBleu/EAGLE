@@ -12,9 +12,18 @@ from concurrent.futures import ThreadPoolExecutor
 s = 0
 e = int(60000*0.95 - 1)
 #e = 68 - 1
-# gpus = [[0],[1],[2],[3],[4],[5],[6],[7]]
+gpus = [
+    [0],
+    [1],
+    # [2],
+    # [3],
+    # [4],
+    # [5],
+    # [6],
+    # [7]
+]
 
-gpus = [[2],[3],[4],[5],[6],[7]]
+# gpus = [[4],[5],[6],[7]]
 
 # gpus=[[0],[1],[2],[3]]
 # gpus=[[0]]
@@ -59,8 +68,8 @@ for i in range(num_p):
     gpu_index = gpus[i]
     gpu_index_str = ' '.join(map(str, gpu_index))
     # gpu_index_str='['+gpu_index_str+']'
-    command = "python ge_data_all_llama2chat.py --index={} --gpu_index {} --outdir {} --data_file {}".format(index,
-                                                                                        gpu_index_str, outdir, args.data_file)
+    command = "python ge_data_all_llama2chat.py --index={} --gpu_index {} --gpu_num {} --outdir {} --data_file {}".format(index,
+                                                                            gpu_index_str, len(gpus), outdir, args.data_file)
     commands.append(command)
 # run_command(commands[0])
 # commands=commands[:1]
