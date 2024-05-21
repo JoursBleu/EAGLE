@@ -9,6 +9,7 @@ parser.add_argument('--gradient-accumulation-steps', type=int, default=1)
 parser.add_argument('--tmpdir', type=str, default='0')
 parser.add_argument('--outdir', type=str, default='0')
 parser.add_argument('--cpdir', type=str, default='0')
+parser.add_argument('--checkpoint', type=str, default=None)
 args = parser.parse_args()
 
 train_config = {
@@ -38,12 +39,13 @@ train_config = {
     "b1": 0.9,
     "b2": 0.95,
     "grad_clip": 0.5,
-    "save_freq": 5,
+    "save_freq": 2,
     "train_config": False,
 }
 import json
 from safetensors import safe_open
 from transformers import AutoModelForCausalLM, AutoTokenizer,AutoModelForSequenceClassification
+import mind_ad.model
 import os
 # os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
 import torch
@@ -71,7 +73,7 @@ tokenizer = AutoTokenizer.from_pretrained(args.basepath, use_fast=False)
 # bigmodel = AutoModelForCausalLM.from_pretrained(args.basepath, device_map="cpu")
 
 config = EConfig.from_pretrained(train_config["config_path"])
-model = Model(config, load_emb=True, path=args.basepath)
+model = Model(config, load_emb=True, bias=False, path=args.basepath, load_checkpoint=args.checkpoint, training=True)
 
 head = torch.nn.Linear(baseconfig.hidden_size, baseconfig.vocab_size, bias=False)
 
@@ -369,7 +371,7 @@ else:
         model, head, optimizer, train_loader, test_loader
     )
 # accelerator.load_state("checkpoints/state_5")
-for epoch in range(num_epochs + 1):
+for epoch in range(num_epochs):
     top_3acc = [0 for _ in range(3)]
     correct = 0
     total = 0
@@ -445,7 +447,7 @@ for epoch in range(num_epochs + 1):
         print('Epoch [{}/{}], Loss: {:.4f}'.format(epoch + 1, num_epochs, epoch_loss))
         print('Train Accuracy: {:.2f}%'.format(100 * correct / total))
 
-    if (epoch + 1) % train_config["save_freq"]:
+    if ((epoch + 1) % train_config["save_freq"]) == 0:
         top_3acc = [0 for _ in range(3)]
         correct = 0
         total = 0

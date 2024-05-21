@@ -43,7 +43,7 @@ class EaModel(nn.Module):
             bias=con["bias"]
         except:
             bias=True
-        self.ea_layer = Model(config,bias=bias)
+        self.ea_layer = Model(config,bias=False)
 
         low_memory=False
 
@@ -122,7 +122,9 @@ class EaModel(nn.Module):
         # print("init:", init)
         # print("input_ids:", input_ids if input_ids is None else input_ids.shape)
         # print("inputs_embeds:", inputs_embeds if inputs_embeds is None else inputs_embeds.shape)
+        print("big input_ids:", input_ids)
         with torch.inference_mode():
+            print("big inputs_embeds:", inputs_embeds)
             # Pass input through the base model
             outputs = self.base_model.model(
                 input_ids=input_ids,
@@ -131,9 +133,12 @@ class EaModel(nn.Module):
                 past_key_values=past_key_values,
                 position_ids=position_ids,
             )
+            print("init:", init)
+            print("big outputs:", outputs)
             if output_orig:
                 orig = self.base_model.lm_head(outputs[0])
             hidden_states = outputs[0].clone()
+            print("big hidden_states.shape:", hidden_states.shape)
         if init:
             if logits_processor is not None:
                 logits = orig[:, -1]
@@ -219,6 +224,7 @@ class EaModel(nn.Module):
         new_token = 0
 
         for idx in range(max_length):
+            print("sample_token", sample_token)
             candidates, cart_candidates_prob, tree_candidates = generate_candidates(
                 tree_logits,
                 tree_buffers["tree_indices"],
@@ -226,6 +232,10 @@ class EaModel(nn.Module):
                 sample_token,
                 logits_processor
             )
+            print("tree_candidates", tree_candidates)
+            print("tree_candidates", self.tokenizer.batch_decode(tree_candidates, skip_special_tokens=True))
+            if idx == 3:
+                exit()
             logits, hidden_state_new, outputs = tree_decoding(
                 self,
                 tree_candidates,

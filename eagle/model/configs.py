@@ -82,6 +82,7 @@ class EConfig(PretrainedConfig):
         num_hidden_layers=32,
         num_attention_heads=32,
         num_key_value_heads=None,
+        attention_bias=False,
         hidden_act="silu",
         max_position_embeddings=2048,
         initializer_range=0.02,
@@ -101,6 +102,7 @@ class EConfig(PretrainedConfig):
         self.intermediate_size = intermediate_size
         self.num_hidden_layers = num_hidden_layers
         self.num_attention_heads = num_attention_heads
+        self.attention_bias = attention_bias
 
         # for backward compatibility
         if num_key_value_heads is None:

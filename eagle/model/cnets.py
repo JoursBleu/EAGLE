@@ -40,6 +40,8 @@ from transformers.utils import (
     logging,
     replace_return_docstrings,
 )
+from transformers import LlamaForCausalLM as HFLlamaForCausalLM
+from transformers.models.llama.modeling_llama import LlamaDecoderLayer as HFLlamaDecoderLayer
 try:
     from .configs import EConfig
     from .utils_c import *
@@ -83,6 +85,7 @@ def _expand_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: Optional[int] 
 
     return inverted_mask.masked_fill(inverted_mask.to(torch.bool), torch.finfo(dtype).min)
 
+ 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     """
     This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
@@ -294,10 +297,10 @@ class LlamaAttention(nn.Module):
             )
 
         if attention_mask is not None:
-            if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
-                raise ValueError(
-                    f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
-                )
+            # if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
+                # raise ValueError(
+                    # f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
+                # )
             attn_weights = attn_weights + attention_mask
 
         # upcast attention to fp32
@@ -382,10 +385,10 @@ class LlamaDecoderLayer(nn.Module):
         self.self_attn = LlamaAttention(config=config)
         self.mlp = LlamaMLP(config)
         self.index=index
-        if self.index!=0:
-            self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
+    @torch.compile()
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -411,8 +414,7 @@ class LlamaDecoderLayer(nn.Module):
 
         residual = hidden_states
 
-        if self.index != 0:
-            hidden_states = self.input_layernorm(hidden_states)
+        # hidden_states = self.input_layernorm(hidden_states)
 
         # Self Attention
         hidden_states, self_attn_weights, present_key_value = self.self_attn(
@@ -441,6 +443,7 @@ class LlamaDecoderLayer(nn.Module):
 
         return outputs
 
+
 class I(nn.Module):
     def __init__(self):
         super().__init__()
@@ -452,11 +455,8 @@ def len_list(x,n):
     return [i for i in x if len(i)<=n]
 
 class Model(nn.Module):
-    def __init__(self,config,load_emb=False,path=None,bias=True):
+    def __init__(self,config,load_emb=False,path=None,bias=True, load_checkpoint=None, training=False):
         super().__init__()
-
-
-
 
         self.gradient_checkpointing = True
         self.padding_idx = config.pad_token_id
@@ -488,11 +488,19 @@ class Model(nn.Module):
 
         #self.init_tree()
 
-        self.layers = nn.ModuleList([LlamaDecoderLayer(config,index) for index in range(config.num_hidden_layers)])
+        if training:
+            self.layers = nn.ModuleList([HFLlamaDecoderLayer(config,index) for index in range(config.num_hidden_layers)])
+        else:
+            self.layers = nn.ModuleList([LlamaDecoderLayer(config,index) for index in range(config.num_hidden_layers)])
         self.fc=nn.Linear(2*config.hidden_size,config.hidden_size,bias=bias)
         self.act=ACT2FN[config.hidden_act]
         for param in self.embed_tokens.parameters():
             param.requires_grad = False
+
+        if load_checkpoint:
+            ea_layer_state_dict = torch.load(load_checkpoint,
+                                             map_location=self.embed_tokens.weight.device)
+            self.load_state_dict(ea_layer_state_dict, strict=True)
 
 
     def init_tree(self):
@@ -590,7 +598,7 @@ class Model(nn.Module):
 
 
         #hidden_states=self.act(self.fc(torch.cat((inputs_embeds,hidden_states),dim=-1)))
-        inputs_embeds=inputs_embeds.to(hidden_states.dtype)
+        inputs_embeds=inputs_embeds.to(hidden_states.dtype).reshape(hidden_states.shape)
         hidden_states = self.fc(torch.cat((inputs_embeds, hidden_states), dim=-1))
 
 
@@ -600,7 +608,6 @@ class Model(nn.Module):
         for idx, decoder_layer in enumerate(self.layers):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
-
             past_key_value = past_key_values[idx] if past_key_values is not None else None
 
             if self.gradient_checkpointing and self.training:
@@ -769,15 +776,17 @@ class Model(nn.Module):
         ss_token,ss_prob,ss_op = [],[],[]
         len_posi=inputs_embeds.shape[1]
         self.reset()
+        
         if use_cache:
-
-
             if hasattr(self, "stable_kv") and self.stable_kv is not None:
                 kv_len=self.stable_kv[0][0].shape[2]
+                # print("small self.stable_kv[0][0].shape", self.stable_kv[0][0].shape)
+                # print("small inputs_embeds.shape", inputs_embeds.shape)
                 out_hidden, past_key_values = self(hidden_states, inputs_embeds=inputs_embeds[:,kv_len:, :], past_key_values=self.stable_kv,use_cache=True)
             else:
                 out_hidden, past_key_values = self(hidden_states, inputs_embeds=inputs_embeds, use_cache=True)
             self.stable_kv=past_key_values
+            # print("small 2 self.stable_kv[0][0].shape", self.stable_kv[0][0].shape)
             last_hidden = out_hidden[:, -1]
             if not self.diff_device:
                 last_headout = head(last_hidden)
