@@ -94,6 +94,9 @@ class EConfig(PretrainedConfig):
         pretraining_tp=1,
         tie_word_embeddings=False,
         rope_scaling=None,
+        router_jitter_noise = 0.0,
+        num_experts_per_tok = None,
+        num_local_experts = None,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -116,6 +119,9 @@ class EConfig(PretrainedConfig):
         self.use_cache = use_cache
         self.rope_scaling = rope_scaling
         self._rope_scaling_validation()
+        self.router_jitter_noise = router_jitter_noise
+        self.num_experts_per_tok = num_experts_per_tok
+        self.num_local_experts = num_local_experts
 
         super().__init__(
             pad_token_id=pad_token_id,

@@ -43,6 +43,7 @@ from transformers.utils import (
 )
 from transformers import LlamaForCausalLM as HFLlamaForCausalLM
 from transformers.models.llama.modeling_llama import LlamaDecoderLayer as HFLlamaDecoderLayer
+from transformers.models.mixtral.modeling_mixtral import MixtralSparseMoeBlock
 try:
     from .configs import EConfig
     from .utils_c import *
@@ -365,7 +366,7 @@ class LlamaMLP(nn.Module):
         else:
             down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
-        return down_proj
+        return down_proj, None
 
 class LlamaRMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
@@ -388,7 +389,8 @@ class LlamaDecoderLayer(nn.Module):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.self_attn = LlamaAttention(config=config)
-        self.mlp = LlamaMLP(config)
+        # self.mlp = LlamaMLP(config)
+        self.mlp = MixtralSparseMoeBlock(config)
         self.index=index
         # self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -438,7 +440,7 @@ class LlamaDecoderLayer(nn.Module):
         # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states, _ = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
 
         outputs = (hidden_states,)
@@ -832,7 +834,7 @@ class Model(nn.Module):
                 out_hidden, past_key_values = self(hidden_states, inputs_embeds=inputs_embeds[:,kv_len:, :], past_key_values=self.stable_kv,use_cache=True)
             else:
                 out_hidden, past_key_values = self(hidden_states, inputs_embeds=inputs_embeds, use_cache=True)
-            self.stable_kv=past_key_values
+            # self.stable_kv=past_key_values
             # print("small 2 self.stable_kv[0][0].shape", self.stable_kv[0][0].shape)
             last_hidden = out_hidden[:, -1]
             if not self.diff_device:
