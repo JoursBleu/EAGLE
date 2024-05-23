@@ -25,6 +25,7 @@ import math
 from typing import List, Optional, Tuple, Union
 
 import torch
+# import torch_tensorrt
 import torch.nn.functional as F
 import torch.utils.checkpoint
 from torch import nn
@@ -242,6 +243,7 @@ class LlamaAttention(nn.Module):
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
         output_attentions: bool = False,
         use_cache: bool = False,
+        context_len: int = None
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         bsz, q_len, _ = hidden_states.size()
 
@@ -272,17 +274,20 @@ class LlamaAttention(nn.Module):
         value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
         kv_seq_len = key_states.shape[-2]
-        if past_key_value is not None:
-            kv_seq_len += past_key_value[0].shape[-2]
+        if use_cache:
+            kv_seq_len += context_len
         cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
-        if past_key_value is not None:
+        if use_cache:
+            # print("key_states", key_states.shape)
             # reuse k, v, self_attention
-            key_states = torch.cat([past_key_value[0], key_states], dim=2)
-            value_states = torch.cat([past_key_value[1], value_states], dim=2)
+            past_key_value[0, :bsz, :, context_len:kv_seq_len, :] = key_states
+            past_key_value[1, :bsz, :, context_len:kv_seq_len, :] = value_states
+            key_states = past_key_value[0, :bsz, :, :kv_seq_len, :]
+            value_states = past_key_value[1, :bsz, :, :kv_seq_len, :]
 
-        past_key_value = (key_states, value_states) if use_cache else None
+        # past_key_value = (key_states, value_states) if use_cache else None
 
         # repeat k/v heads if n_kv_heads < n_heads
         key_states = repeat_kv(key_states, self.num_key_value_groups)
@@ -388,7 +393,7 @@ class LlamaDecoderLayer(nn.Module):
         # self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-    @torch.compile()
+    # @torch.compile()
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -397,6 +402,7 @@ class LlamaDecoderLayer(nn.Module):
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
+        context_len: int = None,
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
         """
         Args:
@@ -424,7 +430,9 @@ class LlamaDecoderLayer(nn.Module):
             past_key_value=past_key_value,
             output_attentions=output_attentions,
             use_cache=use_cache,
+            context_len=context_len,
         )
+        # print("middle attention_output", hidden_states)
         hidden_states = residual + hidden_states
 
         # Fully Connected
@@ -461,6 +469,9 @@ class Model(nn.Module):
         self.gradient_checkpointing = True
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
+        # kv-cache shape [layer_num, 2, bs, kv_head_num, seq_len, kv_head_dim]
+        self.stable_kv = torch.zeros((1, 2, 16, config.num_key_value_heads, 2048, config.hidden_size // config.num_key_value_heads)).cuda().half()
+        self.stable_kv_len = 0
 
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
@@ -488,7 +499,7 @@ class Model(nn.Module):
 
         #self.init_tree()
 
-        if training:
+        if training and False:
             self.layers = nn.ModuleList([HFLlamaDecoderLayer(config,index) for index in range(config.num_hidden_layers)])
         else:
             self.layers = nn.ModuleList([LlamaDecoderLayer(config,index) for index in range(config.num_hidden_layers)])
@@ -567,13 +578,15 @@ class Model(nn.Module):
             with torch.no_grad():
                 inputs_embeds = self.embed_tokens(input_ids)
                 #inputs_embeds = inputs_embeds.detach()
+        # print("input inputs_embeds", inputs_embeds)
+        # print("input small_hidden_states", hidden_states)
 
         # if std is not None:
         #     noise = torch.randn(inputs_embeds.size(),device=inputs_embeds.device) * std
         #     inputs_embeds=inputs_embeds+noise
 
         if past_key_values is not None:
-            past_key_values_length = past_key_values[0][0].shape[2]
+            past_key_values_length = self.stable_kv_len
             seq_length_with_past = seq_length_with_past + past_key_values_length
         if position_ids is None:
             device = hidden_states.device if hidden_states is not None else inputs_embeds.device
@@ -598,8 +611,9 @@ class Model(nn.Module):
 
 
         #hidden_states=self.act(self.fc(torch.cat((inputs_embeds,hidden_states),dim=-1)))
-        inputs_embeds=inputs_embeds.to(hidden_states.dtype).reshape(hidden_states.shape)
+        inputs_embeds=inputs_embeds.reshape(hidden_states.shape)
         hidden_states = self.fc(torch.cat((inputs_embeds, hidden_states), dim=-1))
+        # print("small_hidden_states", hidden_states)
 
 
         all_hidden_states = () if output_hidden_states else None
@@ -634,6 +648,7 @@ class Model(nn.Module):
                     past_key_value=past_key_value,
                     output_attentions=output_attentions,
                     use_cache=use_cache,
+                    context_len=self.stable_kv_len,
                 )
 
             hidden_states = layer_outputs[0]
@@ -641,7 +656,10 @@ class Model(nn.Module):
             if use_cache:
                 next_decoder_cache += (layer_outputs[2 if output_attentions else 1],)
 
+        # print("return small_hidden_states.shape", hidden_states.shape)
+        # print("return small_hidden_states", hidden_states)
         if use_cache:
+            self.stable_kv_len += inputs_embeds.shape[1]
             return hidden_states,next_decoder_cache
 
         return hidden_states
@@ -696,8 +714,11 @@ class Model(nn.Module):
         return tuple(newkv)
 
 
-    def reset_kv(self):
-        self.stable_kv=None
+    def reset_kv(self, new_len: int=0):
+        self.stable_kv_len = new_len
+
+    def revert_kv(self, revert_len: int=0):
+        self.stable_kv_len -= revert_len
 
     @torch.no_grad()
     def repeat_hidden(self,hidden_state,repeat_num):
@@ -768,6 +789,32 @@ class Model(nn.Module):
         #     return sampled_indices, sampled_probs
 
     @torch.no_grad()
+    def topOne_genrate(self, hidden_states, inputs_embeds, head, logits_processor, max_length=10):
+        ss_token = []
+        # self.reset()
+        # print("self.stable_kv_len", self.stable_kv_len)
+        # print("hidden_states", hidden_states.shape)
+        # print("inputs_embeds", inputs_embeds.shape)
+        out_hidden, past_key_values = self(hidden_states, inputs_embeds=inputs_embeds[:,self.stable_kv_len:, :], past_key_values=self.stable_kv,use_cache=True)
+        last_hidden = out_hidden[:, -1]
+        last_headout = head(last_hidden)
+
+        hidden_states = out_hidden[:, -1:]
+        for i in range(max_length-1):
+
+            input_ids = torch.argmax(last_headout, dim=-1).to(torch.int32)
+            ss_token.append(input_ids)
+            out_hidden, past_key_values = self(hidden_states, input_ids=input_ids, past_key_values=self.stable_kv, use_cache=True)
+            last_headout = head(out_hidden[0])
+            hidden_states=out_hidden
+
+        input_ids = torch.argmax(last_headout, dim=-1).to(torch.int32)
+        ss_token.append(input_ids)
+
+        return (torch.cat(ss_token),None,None)
+
+
+    @torch.no_grad()
     def topK_genrate(self, hidden_states, inputs_embeds, head, logits_processor,max_length=4, use_cache=True):
         # test_=input_ids
         # input_ids = torch.tensor([state[1:]])
@@ -779,7 +826,7 @@ class Model(nn.Module):
         
         if use_cache:
             if hasattr(self, "stable_kv") and self.stable_kv is not None:
-                kv_len=self.stable_kv[0][0].shape[2]
+                kv_len=self.stable_kv_len
                 # print("small self.stable_kv[0][0].shape", self.stable_kv[0][0].shape)
                 # print("small inputs_embeds.shape", inputs_embeds.shape)
                 out_hidden, past_key_values = self(hidden_states, inputs_embeds=inputs_embeds[:,kv_len:, :], past_key_values=self.stable_kv,use_cache=True)
@@ -823,6 +870,9 @@ class Model(nn.Module):
                 #hidden_states = hidden_states.repeat(1,len_sq,1)
                 self.tree_mask=self.tree_buffer['attn_mask'][i]
                 position_ids=len_posi+self.tree_buffer["position_ids"][i]
+                # print("topk_index", topk_index)
+                # print("select_index", select_index)
+                # print("input_ids", input_ids)
                 out_hidden, past_key_values = self(hidden_states, input_ids=input_ids, past_key_values=past_key_values,
                                                    position_ids=position_ids,use_cache=True)
                 len_posi += 1
