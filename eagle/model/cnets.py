@@ -471,12 +471,14 @@ class Model(nn.Module):
         self.gradient_checkpointing = True
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
+        self.base_hidden_size = config.base_hidden_size
+        self.hidden_size = config.hidden_size
         # kv-cache shape [layer_num, 2, bs, kv_head_num, seq_len, kv_head_dim]
-        self.stable_kv = torch.zeros((1, 2, 16, config.num_key_value_heads, 2048, config.hidden_size // config.num_key_value_heads)).cuda().half()
+        self.stable_kv = torch.zeros((1, 2, 16, config.num_key_value_heads, 2048, self.hidden_size // config.num_key_value_heads)).cuda().half()
         self.stable_kv_len = 0
 
 
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
+        self.embed_tokens = nn.Embedding(config.vocab_size, self.base_hidden_size, self.padding_idx)
         if load_emb:
             from safetensors import safe_open
             import json
@@ -505,7 +507,9 @@ class Model(nn.Module):
             self.layers = nn.ModuleList([HFLlamaDecoderLayer(config,index) for index in range(config.num_hidden_layers)])
         else:
             self.layers = nn.ModuleList([LlamaDecoderLayer(config,index) for index in range(config.num_hidden_layers)])
-        self.fc=nn.Linear(2*config.hidden_size,config.hidden_size,bias=bias)
+        self.fc=nn.Linear(2*self.base_hidden_size,self.hidden_size,bias=bias)
+        if (self.base_hidden_size != self.hidden_size):
+            self.fc_back=nn.Linear(self.hidden_size,self.base_hidden_size,bias=bias)
         self.act=ACT2FN[config.hidden_act]
         for param in self.embed_tokens.parameters():
             param.requires_grad = False
@@ -658,11 +662,14 @@ class Model(nn.Module):
             if use_cache:
                 next_decoder_cache += (layer_outputs[2 if output_attentions else 1],)
 
+        if (self.base_hidden_size != self.hidden_size):
+            hidden_states = self.fc_back(hidden_states)
+
         # print("return small_hidden_states.shape", hidden_states.shape)
         # print("return small_hidden_states", hidden_states)
         if use_cache:
             self.stable_kv_len += inputs_embeds.shape[1]
-            return hidden_states,next_decoder_cache
+            return hidden_states
 
         return hidden_states
 
@@ -791,22 +798,29 @@ class Model(nn.Module):
         #     return sampled_indices, sampled_probs
 
     @torch.no_grad()
-    def topOne_genrate(self, hidden_states, inputs_embeds, head, logits_processor, max_length=10):
+    def topOne_genrate(self, hidden_states, inputs_embeds, head, logits_processor, max_length=10, end_ids=None):
         ss_token = []
         # self.reset()
         # print("self.stable_kv_len", self.stable_kv_len)
         # print("hidden_states", hidden_states.shape)
         # print("inputs_embeds", inputs_embeds.shape)
-        out_hidden, past_key_values = self(hidden_states, inputs_embeds=inputs_embeds[:,self.stable_kv_len:, :], past_key_values=self.stable_kv,use_cache=True)
+        out_hidden = self(hidden_states, inputs_embeds=inputs_embeds[:,self.stable_kv_len:, :], past_key_values=self.stable_kv,use_cache=True)
         last_hidden = out_hidden[:, -1]
         last_headout = head(last_hidden)
 
         hidden_states = out_hidden[:, -1:]
         for i in range(max_length-1):
-
             input_ids = torch.argmax(last_headout, dim=-1).to(torch.int32)
+
+            # torch.onnx.export(self, {'hidden_states': hidden_states, 'input_ids': input_ids, 'past_key_values': self.stable_kv, 'use_cache':True}, "eagle_small.onnx",
+                  # input_names=["hidden_states", "input_ids", "past_key_values", "use_cache"], output_names=["out_hidden"],
+                  # dynamic_axes={"input": {1: "seq_len"}, "output": {1: "seq_len"}})
+            # exit()
+
             ss_token.append(input_ids)
-            out_hidden, past_key_values = self(hidden_states, input_ids=input_ids, past_key_values=self.stable_kv, use_cache=True)
+            if end_ids in ss_token:
+                return (torch.cat(ss_token),None,None)
+            out_hidden = self(hidden_states, input_ids=input_ids, past_key_values=self.stable_kv, use_cache=True)
             last_headout = head(out_hidden[0])
             hidden_states=out_hidden
 

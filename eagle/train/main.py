@@ -77,6 +77,8 @@ model = Model(config, load_emb=True, bias=False, path=args.basepath, load_checkp
 
 head = torch.nn.Linear(baseconfig.hidden_size, baseconfig.vocab_size, bias=False)
 
+print("model:", model)
+
 try:
     with open(os.path.join(args.basepath, "model.safetensors.index.json"), "r") as f:
         index_json = json.loads(f.read())

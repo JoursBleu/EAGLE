@@ -97,6 +97,7 @@ class EConfig(PretrainedConfig):
         router_jitter_noise = 0.0,
         num_experts_per_tok = None,
         num_local_experts = None,
+        base_hidden_size=None,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -106,6 +107,7 @@ class EConfig(PretrainedConfig):
         self.num_hidden_layers = num_hidden_layers
         self.num_attention_heads = num_attention_heads
         self.attention_bias = attention_bias
+        self.base_hidden_size = hidden_size if base_hidden_size is None else base_hidden_size
 
         # for backward compatibility
         if num_key_value_heads is None:
