@@ -509,7 +509,7 @@ for epoch in range(num_epochs):
         if accelerator.is_local_main_process:
             print('Test Epoch [{}/{}], Loss: {:.4f}'.format(epoch + 1, num_epochs, epoch_loss))
             print('Test Accuracy: {:.2f}%'.format(100 * correct / total))
-            accelerator.save_model(model, f"checkpoints/model_{epoch}", safe_serialization=False)
+            accelerator.save_model(model, f"{args.outdir}/model_{epoch}", safe_serialization=False)
             # accelerator.save_state(output_dir=f"{args.outdir}/state_{epoch}")
             # os.system(f"cp -r {args.outdir} {args.cpdir}")
             # accelerator.save_state(output_dir=f"{args.cpdir}/state_{epoch}")
