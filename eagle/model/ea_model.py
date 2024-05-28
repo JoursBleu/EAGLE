@@ -27,6 +27,7 @@ class EaModel(nn.Module):
             base_model,
             base_model_name_or_path,
             ea_model_path,
+            ea_engine_path=None,
     ):
 
         super().__init__()
@@ -43,7 +44,7 @@ class EaModel(nn.Module):
             bias=con["bias"]
         except:
             bias=True
-        self.ea_layer = Model(config,bias=False)
+        self.ea_layer = Model(config,bias=False, ea_engine_path=ea_engine_path)
 
         low_memory=False
 
@@ -77,6 +78,7 @@ class EaModel(nn.Module):
             Type="LLaMA",
             base_model_path=None,
             ea_model_path=None,
+            ea_engine_path=None,
             **kwargs,
     ):
         #assert Type=="LLaMA" or "Mixtral"
@@ -96,7 +98,8 @@ class EaModel(nn.Module):
         model = cls(
             base_model,
             base_model_path,
-            configpath
+            configpath,
+            ea_engine_path,
         )
         load_model_path=os.path.join(ea_model_path, "pytorch_model.bin")
         if not os.path.exists(load_model_path):

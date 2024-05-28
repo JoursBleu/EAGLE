@@ -95,8 +95,8 @@ class EConfig(PretrainedConfig):
         tie_word_embeddings=False,
         rope_scaling=None,
         router_jitter_noise = 0.0,
-        num_experts_per_tok = None,
-        num_local_experts = None,
+        num_experts_per_tok = 1,
+        num_local_experts = 0,
         base_hidden_size=None,
         **kwargs,
     ):

@@ -20,16 +20,35 @@
 """ PyTorch LLaMA model."""
 import copy
 import os
+import onnx
+# import onnx_tensorrt.backend as backend
+# import onnxruntime as ort
+import sys
+import time
 #os.environ["CUDA_VISIBLE_DEVICES"] = "5"
 import math
 from typing import List, Optional, Tuple, Union
 
 import torch
+from torch import Tensor
 # import torch_tensorrt
 import torch.nn.functional as F
 import torch.utils.checkpoint
 from torch import nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
+
+import tensorrt
+from cuda import cudart
+
+def CUASSERT(cuda_ret):
+    err = cuda_ret[0]
+    if err != cudart.cudaError_t.cudaSuccess:
+        raise RuntimeError(
+            f"CUDA ERROR: {err}, error code reference: https://nvidia.github.io/cuda-python/module/cudart.html#cuda.cudart.cudaError_t"
+        )
+    if len(cuda_ret) > 1:
+        return cuda_ret[1:]
+    return None
 
 from transformers.activations import ACT2FN
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast, SequenceClassifierOutputWithPast
@@ -138,14 +157,10 @@ class LlamaRotaryEmbedding(torch.nn.Module):
         self.register_buffer("cos_cached", emb.cos()[None, None, :, :].to(dtype), persistent=False)
         self.register_buffer("sin_cached", emb.sin()[None, None, :, :].to(dtype), persistent=False)
 
-    def forward(self, x, seq_len=None):
-        # x: [bs, num_attention_heads, seq_len, head_size]
-        if seq_len > self.max_seq_len_cached:
-            self._set_cos_sin_cache(seq_len=seq_len, device=x.device, dtype=x.dtype)
-
+    def forward(self, x):
         return (
-            self.cos_cached[:, :, :seq_len, ...].to(dtype=x.dtype),
-            self.sin_cached[:, :, :seq_len, ...].to(dtype=x.dtype),
+            self.cos_cached.to(dtype=x.dtype),
+            self.sin_cached.to(dtype=x.dtype),
         )
 
 class LlamaLinearScalingRotaryEmbedding(LlamaRotaryEmbedding):
@@ -191,6 +206,64 @@ class LlamaDynamicNTKScalingRotaryEmbedding(LlamaRotaryEmbedding):
         emb = torch.cat((freqs, freqs), dim=-1)
         self.register_buffer("cos_cached", emb.cos()[None, None, :, :].to(dtype), persistent=False)
         self.register_buffer("sin_cached", emb.sin()[None, None, :, :].to(dtype), persistent=False)
+
+# class Linear(Module):
+    # __constants__ = ['in_features', 'out_features']
+    # in_features: int
+    # out_features: int
+    # weight: Tensor
+
+    # def __init__(self, in_features: int, out_features: int, bias: bool = True,
+                 # device=None, dtype=None) -> None:
+        # factory_kwargs = {'device': device, 'dtype': dtype}
+        # super().__init__()
+        # self.in_features = in_features
+        # self.out_features = out_features
+        # self.weight = Parameter(torch.empty((out_features, in_features), **factory_kwargs))
+        # if bias:
+            # self.bias = Parameter(torch.empty(out_features, **factory_kwargs))
+        # else:
+            # self.register_parameter('bias', None)
+        # self.reset_parameters()
+
+    # def reset_parameters(self) -> None:
+        # # Setting a=sqrt(5) in kaiming_uniform is the same as initializing with
+        # # uniform(-1/sqrt(in_features), 1/sqrt(in_features)). For details, see
+        # # https://github.com/pytorch/pytorch/issues/57109
+        # init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        # if self.bias is not None:
+            # fan_in, _ = init._calculate_fan_in_and_fan_out(self.weight)
+            # bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+            # init.uniform_(self.bias, -bound, bound)
+
+    # def forward(self, input: Tensor) -> Tensor:
+        # return F.linear(input, self.weight, self.bias)
+
+    # def extra_repr(self) -> str:
+        # return f'in_features={self.in_features}, out_features={self.out_features}, bias={self.bias is not None}'
+
+# class LinearInt4(nn.Module):
+    # __constants__ = ['in_features', 'out_features']
+    # in_features: int
+    # out_features: int
+    # weight: Tensor
+    # scale: Tensor
+    # zp: Tensor
+
+    # def __init__(self, in_features: int, out_features: int, bias: bool = True,
+                 # device=None, dtype=None) -> None:
+        # super().__init__()
+        # self.in_features = in_features
+        # self.out_features = out_features
+        # self.weight = Parameter(torch.empty((out_features, in_features), 'device': device, 'dtype': torch.int4))
+        # self.scale = Parameter(torch.empty((out_features, in_features), 'device': device, 'dtype': dtype))
+        # self.scale = Parameter(torch.empty((out_features, in_features), 'device': device, 'dtype': dtype))
+        # if bias:
+            # self.bias = Parameter(torch.empty(out_features, **factory_kwargs))
+        # else:
+            # self.register_parameter('bias', None)
+        # self.reset_parameters()
+        
 
 class LlamaAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
@@ -244,95 +317,51 @@ class LlamaAttention(nn.Module):
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
         output_attentions: bool = False,
         use_cache: bool = False,
-        context_len: int = None
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         bsz, q_len, _ = hidden_states.size()
 
-        if self.config.pretraining_tp > 1:
-            key_value_slicing = (self.num_key_value_heads * self.head_dim) // self.config.pretraining_tp
-            query_slices = self.q_proj.weight.split(
-                (self.num_heads * self.head_dim) // self.config.pretraining_tp, dim=0
-            )
-            key_slices = self.k_proj.weight.split(key_value_slicing, dim=0)
-            value_slices = self.v_proj.weight.split(key_value_slicing, dim=0)
-
-            query_states = [F.linear(hidden_states, query_slices[i]) for i in range(self.config.pretraining_tp)]
-            query_states = torch.cat(query_states, dim=-1)
-
-            key_states = [F.linear(hidden_states, key_slices[i]) for i in range(self.config.pretraining_tp)]
-            key_states = torch.cat(key_states, dim=-1)
-
-            value_states = [F.linear(hidden_states, value_slices[i]) for i in range(self.config.pretraining_tp)]
-            value_states = torch.cat(value_states, dim=-1)
-
-        else:
-            query_states = self.q_proj(hidden_states)
-            key_states = self.k_proj(hidden_states)
-            value_states = self.v_proj(hidden_states)
+        query_states = self.q_proj(hidden_states)
+        key_states = self.k_proj(hidden_states)
+        value_states = self.v_proj(hidden_states)
 
         query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
         key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
         value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
-        kv_seq_len = key_states.shape[-2]
-        if use_cache:
-            kv_seq_len += context_len
-        cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+        cos, sin = self.rotary_emb(value_states)
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
-        if use_cache:
-            # print("key_states", key_states.shape)
-            # reuse k, v, self_attention
-            past_key_value[0, :bsz, :, context_len:kv_seq_len, :] = key_states
-            past_key_value[1, :bsz, :, context_len:kv_seq_len, :] = value_states
-            key_states = past_key_value[0, :bsz, :, :kv_seq_len, :]
-            value_states = past_key_value[1, :bsz, :, :kv_seq_len, :]
+        if past_key_value is not None:
+            key_states_ = torch.concat((past_key_value[0], key_states), dim=2)
+            value_states_ = torch.concat((past_key_value[1], value_states), dim=2)
+        else:
+            key_states_ = key_states
+            value_states_ = value_states
 
         # past_key_value = (key_states, value_states) if use_cache else None
 
-        # repeat k/v heads if n_kv_heads < n_heads
-        key_states = repeat_kv(key_states, self.num_key_value_groups)
-        value_states = repeat_kv(value_states, self.num_key_value_groups)
+        # # repeat k/v heads if n_kv_heads < n_heads
+        # key_states = repeat_kv(key_states, self.num_key_value_groups)
+        # value_states = repeat_kv(value_states, self.num_key_value_groups)
 
-        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+        attn_weights = torch.matmul(query_states, key_states_.transpose(2, 3)) / math.sqrt(self.head_dim)
 
-        if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
-            raise ValueError(
-                f"Attention weights should be of size {(bsz, self.num_heads, q_len, kv_seq_len)}, but is"
-                f" {attn_weights.size()}"
-            )
-
+        # attn_weights with shape [bs, head_num, new_seqlen, all_seqlen]
         if attention_mask is not None:
-            # if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
-                # raise ValueError(
-                    # f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
-                # )
-            attn_weights = attn_weights + attention_mask
+            attention_mask = torch.empty_like(attn_weights[0,0]).fill_(torch.finfo(attn_weights.dtype).min)
+            attention_mask = torch.triu(attention_mask, diagonal=(attn_weights.shape[3]-attn_weights.shape[2]+1))
+            attn_weights += attention_mask
 
         # upcast attention to fp32
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-        attn_output = torch.matmul(attn_weights, value_states)
-
-        if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
-            raise ValueError(
-                f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, but is"
-                f" {attn_output.size()}"
-            )
+        attn_output = torch.matmul(attn_weights, value_states_)
 
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
 
-        if self.config.pretraining_tp > 1:
-            attn_output = attn_output.split(self.hidden_size // self.config.pretraining_tp, dim=2)
-            o_proj_slices = self.o_proj.weight.split(self.hidden_size // self.config.pretraining_tp, dim=1)
-            attn_output = sum([F.linear(attn_output[i], o_proj_slices[i]) for i in range(self.config.pretraining_tp)])
-        else:
-            attn_output = self.o_proj(attn_output)
+        attn_output = self.o_proj(attn_output)
 
-        if not output_attentions:
-            attn_weights = None
-
-        return attn_output, attn_weights, past_key_value
+        return attn_output, None, (key_states,value_states)
 
 
 class LlamaMLP(nn.Module):
@@ -385,12 +414,14 @@ class LlamaRMSNorm(nn.Module):
         return self.weight * hidden_states.to(input_dtype)
 
 class LlamaDecoderLayer(nn.Module):
-    def __init__(self, config,index):
+    def __init__(self, config, index):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.self_attn = LlamaAttention(config=config)
-        # self.mlp = LlamaMLP(config)
-        self.mlp = MixtralSparseMoeBlock(config)
+        if config.num_local_experts > 0:
+            self.mlp = MixtralSparseMoeBlock(config)
+        else:
+            self.mlp = LlamaMLP(config)
         self.index=index
         # self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -404,7 +435,6 @@ class LlamaDecoderLayer(nn.Module):
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
-        context_len: int = None,
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
         """
         Args:
@@ -432,7 +462,6 @@ class LlamaDecoderLayer(nn.Module):
             past_key_value=past_key_value,
             output_attentions=output_attentions,
             use_cache=use_cache,
-            context_len=context_len,
         )
         # print("middle attention_output", hidden_states)
         hidden_states = residual + hidden_states
@@ -445,11 +474,7 @@ class LlamaDecoderLayer(nn.Module):
 
         outputs = (hidden_states,)
 
-        if output_attentions:
-            outputs += (self_attn_weights,)
-
-        if use_cache:
-            outputs += (present_key_value,)
+        outputs += (present_key_value,)
 
         return outputs
 
@@ -465,7 +490,7 @@ def len_list(x,n):
     return [i for i in x if len(i)<=n]
 
 class Model(nn.Module):
-    def __init__(self,config,load_emb=False,path=None,bias=True, load_checkpoint=None, training=False):
+    def __init__(self,config,load_emb=False,path=None,bias=True, load_checkpoint=None, training=False, ea_engine_path=None):
         super().__init__()
 
         self.gradient_checkpointing = True
@@ -473,9 +498,13 @@ class Model(nn.Module):
         self.vocab_size = config.vocab_size
         self.base_hidden_size = config.base_hidden_size
         self.hidden_size = config.hidden_size
+        self.num_key_value_heads = config.num_key_value_heads
         # kv-cache shape [layer_num, 2, bs, kv_head_num, seq_len, kv_head_dim]
-        self.stable_kv = torch.zeros((1, 2, 16, config.num_key_value_heads, 2048, self.hidden_size // config.num_key_value_heads)).cuda().half()
+        self.stable_kv = torch.zeros((2, 16, config.num_key_value_heads, 1024, self.hidden_size // config.num_key_value_heads)).cuda().half()
+        self.trt_k_out = torch.zeros((1, config.num_key_value_heads, 1, self.hidden_size // config.num_key_value_heads)).cuda().half()
+        self.trt_v_out = torch.zeros((1, config.num_key_value_heads, 1, self.hidden_size // config.num_key_value_heads)).cuda().half()
         self.stable_kv_len = 0
+        self.eagle_gen_time = 0.
 
 
         self.embed_tokens = nn.Embedding(config.vocab_size, self.base_hidden_size, self.padding_idx)
@@ -518,6 +547,33 @@ class Model(nn.Module):
             ea_layer_state_dict = torch.load(load_checkpoint,
                                              map_location=self.embed_tokens.weight.device)
             self.load_state_dict(ea_layer_state_dict, strict=True)
+
+        # self.session = ort.InferenceSession("trt-org/eagle_small.onnx", providers=['CUDAExecutionProvider'])
+        self.torch_stream = torch.cuda.current_stream()
+        self.cuda_stream = torch.cuda.current_stream().cuda_stream
+        self.trt_engine = False
+        if ea_engine_path is not None:
+            with open(ea_engine_path+"/context.trt", "rb") as f, tensorrt.Runtime(tensorrt.Logger()) as runtime:
+                self.context_engine = runtime.deserialize_cuda_engine(f.read())
+                address = CUASSERT(cudart.cudaMalloc(self.context_engine.device_memory_size))[0]
+            self.context_context = self.context_engine.create_execution_context_without_device_memory()
+            self.context_context.set_optimization_profile_async(0, self.cuda_stream)
+            self.context_context.device_memory = address
+            with open(ea_engine_path+"/prefill.trt", "rb") as f, tensorrt.Runtime(tensorrt.Logger()) as runtime:
+                self.prefill_engine = runtime.deserialize_cuda_engine(f.read())
+                address = CUASSERT(cudart.cudaMalloc(self.prefill_engine.device_memory_size))[0]
+            self.prefill_context = self.prefill_engine.create_execution_context_without_device_memory()
+            self.prefill_context.set_optimization_profile_async(0, self.cuda_stream)
+            self.prefill_context.device_memory = address
+            with open(ea_engine_path+"/generate.trt", "rb") as f, tensorrt.Runtime(tensorrt.Logger()) as runtime:
+                self.engine = runtime.deserialize_cuda_engine(f.read())
+                address = CUASSERT(cudart.cudaMalloc(self.engine.device_memory_size))[0]
+            self.context = self.engine.create_execution_context_without_device_memory()
+            self.context.set_optimization_profile_async(0, self.cuda_stream)
+            self.context.device_memory = address
+            self._set_tensor(self.engine, self.context, "past_key_out", self.trt_k_out)
+            self._set_tensor(self.engine, self.context, "past_val_out", self.trt_v_out)
+            self.trt_engine = True
 
 
     def init_tree(self):
@@ -565,113 +621,35 @@ class Model(nn.Module):
     def forward(
         self,
         hidden_states,
-        input_ids=None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[List[torch.FloatTensor]] = None,
+        input_ids = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
+        past_key_values: Optional[List[torch.FloatTensor]] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
-        std=None
+        head=None,
     ):
-        batch_size, seq_length, _ = hidden_states.shape
-        seq_length_with_past = seq_length
-        past_key_values_length = 0
-
         if input_ids is not None:
-            with torch.no_grad():
-                inputs_embeds = self.embed_tokens(input_ids)
-                #inputs_embeds = inputs_embeds.detach()
-        # print("input inputs_embeds", inputs_embeds)
-        # print("input small_hidden_states", hidden_states)
-
-        # if std is not None:
-        #     noise = torch.randn(inputs_embeds.size(),device=inputs_embeds.device) * std
-        #     inputs_embeds=inputs_embeds+noise
-
-        if past_key_values is not None:
-            past_key_values_length = self.stable_kv_len
-            seq_length_with_past = seq_length_with_past + past_key_values_length
-        if position_ids is None:
-            device = hidden_states.device if hidden_states is not None else inputs_embeds.device
-            position_ids = torch.arange(
-                past_key_values_length, seq_length + past_key_values_length, dtype=torch.long, device=device
-            )
-            position_ids = position_ids.unsqueeze(0).view(-1, seq_length)
-        else:
-            position_ids = position_ids.view(-1, seq_length).long()
-
-        if attention_mask is None:
-            attention_mask = torch.ones(
-                (batch_size, seq_length_with_past), dtype=torch.bool, device=hidden_states.device
-            )
-        attention_mask = self._prepare_decoder_attention_mask(
-            attention_mask, (batch_size, seq_length), hidden_states, past_key_values_length
-        )
-
-        # if self.gradient_checkpointing and self.training:
-        #    if use_cache:
-        #        use_cache = False
-
-
-        #hidden_states=self.act(self.fc(torch.cat((inputs_embeds,hidden_states),dim=-1)))
-        inputs_embeds=inputs_embeds.reshape(hidden_states.shape)
+            inputs_embeds = self.embed_tokens(input_ids).reshape(hidden_states.shape)
         hidden_states = self.fc(torch.cat((inputs_embeds, hidden_states), dim=-1))
-        # print("small_hidden_states", hidden_states)
+        print("cnet fc hidden_states", hidden_states)
+        layer_outputs = self.layers[0](
+            hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_value=past_key_values,
+            output_attentions=output_attentions,
+            use_cache=use_cache,
+        )
+        hidden_states, kv_cache = layer_outputs
 
+        print("cnet decode hidden_states", hidden_states)
+        # hidden_states = self.fc_back(hidden_states[:,-1:])
 
-        all_hidden_states = () if output_hidden_states else None
-        next_decoder_cache = () if use_cache else None
-
-        for idx, decoder_layer in enumerate(self.layers):
-            if output_hidden_states:
-                all_hidden_states += (hidden_states,)
-            past_key_value = past_key_values[idx] if past_key_values is not None else None
-
-            if self.gradient_checkpointing and self.training:
-
-                def create_custom_forward(module):
-                    def custom_forward(*inputs):
-                        # None for past_key_value
-                        return module(*inputs, past_key_value, output_attentions)
-
-                    return custom_forward
-
-                layer_outputs = torch.utils.checkpoint.checkpoint(
-                    create_custom_forward(decoder_layer),
-                    hidden_states,
-                    attention_mask,
-                    position_ids,
-                    use_reentrant=True,
-                )
-            else:
-                layer_outputs = decoder_layer(
-                    hidden_states,
-                    attention_mask=attention_mask,
-                    position_ids=position_ids,
-                    past_key_value=past_key_value,
-                    output_attentions=output_attentions,
-                    use_cache=use_cache,
-                    context_len=self.stable_kv_len,
-                )
-
-            hidden_states = layer_outputs[0]
-
-            if use_cache:
-                next_decoder_cache += (layer_outputs[2 if output_attentions else 1],)
-
-        if (self.base_hidden_size != self.hidden_size):
-            hidden_states = self.fc_back(hidden_states)
-
-        # print("return small_hidden_states.shape", hidden_states.shape)
-        # print("return small_hidden_states", hidden_states)
-        if use_cache:
-            self.stable_kv_len += inputs_embeds.shape[1]
-            return hidden_states
-
-        return hidden_states
+        return hidden_states, kv_cache
 
     @torch.no_grad()
     def generate(self,hidden_states,input_ids,head,max_length=4,use_cache=False):
@@ -797,33 +775,197 @@ class Model(nn.Module):
         #
         #     return sampled_indices, sampled_probs
 
+    def _set_tensor(self, engine, context: tensorrt.IExecutionContext,
+                    name, tensor):
+        if engine.get_tensor_mode(name) == tensorrt.TensorIOMode.INPUT:
+            context.set_input_shape(name, list(tensor.size()))
+        context.set_tensor_address(name, tensor.data_ptr())
+
+    def _check_tensors(self, engine, context: tensorrt.IExecutionContext) -> None:
+        for i in range(engine.num_io_tensors):
+            name = engine.get_tensor_name(i)
+            ptr = context.get_tensor_address(name)
+            if ptr == 0:
+                raise RuntimeError(f"Engine I/O tensor {name} is unbound")
+            # print("tensor_name", name)
+            # print("ptr", ptr)
+
     @torch.no_grad()
-    def topOne_genrate(self, hidden_states, inputs_embeds, head, logits_processor, max_length=10, end_ids=None):
+    def topOne_genrate(self, hidden_states, inputs_embeds, head, logits_processor, max_length=10, prefill=False, end_ids=None):
         ss_token = []
         # self.reset()
         # print("self.stable_kv_len", self.stable_kv_len)
-        # print("hidden_states", hidden_states.shape)
-        # print("inputs_embeds", inputs_embeds.shape)
-        out_hidden = self(hidden_states, inputs_embeds=inputs_embeds[:,self.stable_kv_len:, :], past_key_values=self.stable_kv,use_cache=True)
-        last_hidden = out_hidden[:, -1]
-        last_headout = head(last_hidden)
+        # print("hidden_states", hidden_states)
+        # print("inputs_embeds", inputs_embeds)
+        batch_size, seq_length, _ = hidden_states.shape
+        inputs_embeds = inputs_embeds[:,self.stable_kv_len:, :].reshape(hidden_states.shape)
+        position_ids = torch.arange(
+            self.stable_kv_len,
+            self.stable_kv_len + seq_length,
+            dtype=torch.long,
+            device=hidden_states.device,
+        )
+        position_ids = position_ids.unsqueeze(0).view(-1, seq_length)
 
-        hidden_states = out_hidden[:, -1:]
-        for i in range(max_length-1):
-            input_ids = torch.argmax(last_headout, dim=-1).to(torch.int32)
-
-            # torch.onnx.export(self, {'hidden_states': hidden_states, 'input_ids': input_ids, 'past_key_values': self.stable_kv, 'use_cache':True}, "eagle_small.onnx",
-                  # input_names=["hidden_states", "input_ids", "past_key_values", "use_cache"], output_names=["out_hidden"],
-                  # dynamic_axes={"input": {1: "seq_len"}, "output": {1: "seq_len"}})
+        # if prefill:
+            # torch.onnx.export(
+                # self,
+                # {
+                  # 'hidden_states': hidden_states,
+                  # 'inputs_embeds': inputs_embeds,
+                  # 'position_ids': position_ids,
+                # },
+                # "trt-mds/prefill.onnx",
+                # input_names=["hidden_states", "inputs_embeds", "position_ids"], output_names=["out_hidden", "past_key_out", "past_val_out"],
+                # dynamic_axes={
+                    # "hidden_states": {1: "seq_len"},
+                    # 'inputs_embeds': {1: "seq_len"},
+                    # "position_ids": {1: "seq_len"},
+                    # "out_hidden": {1: "seq_len"},
+                    # "past_key_out": {2: "seq_len"},
+                    # "past_val_out": {2: "seq_len"},
+                # }
+            # )
+            # exit()
+        # if not prefill:
+            # torch.onnx.export(
+                # self,
+                # {
+                  # 'hidden_states': hidden_states,
+                  # 'inputs_embeds': inputs_embeds,
+                  # 'past_key_values': self.stable_kv[:, :batch_size, :, :self.stable_kv_len, :],
+                  # 'position_ids': position_ids,
+                # },
+                # "trt-mds/context.onnx",
+                # input_names=["hidden_states", "inputs_embeds", "past_key_values", "position_ids"], output_names=["out_hidden", "past_key_out", "past_val_out"],
+                # dynamic_axes={
+                    # "hidden_states": {1: "seq_len"},
+                    # 'inputs_embeds': {1: "seq_len"},
+                    # "past_key_values": {3: "base_seq_len"},
+                    # "position_ids": {1: "seq_len"},
+                    # "out_hidden": {1: "seq_len"},
+                    # "past_key_out": {2: "seq_len"},
+                    # "past_val_out": {2: "seq_len"},
+                # }
+            # )
             # exit()
 
-            ss_token.append(input_ids)
-            if end_ids in ss_token:
-                return (torch.cat(ss_token),None,None)
-            out_hidden = self(hidden_states, input_ids=input_ids, past_key_values=self.stable_kv, use_cache=True)
-            last_headout = head(out_hidden[0])
-            hidden_states=out_hidden
+        key_cache = torch.empty((1, self.num_key_value_heads, hidden_states.shape[1], self.hidden_size // self.num_key_value_heads),
+                                device=hidden_states.device, dtype=hidden_states.dtype)
+        val_cache = torch.empty((1, self.num_key_value_heads, hidden_states.shape[1], self.hidden_size // self.num_key_value_heads),
+                                device=hidden_states.device, dtype=hidden_states.dtype)
 
+        # self.torch_stream.synchronize()
+        start = time.time()
+        if self.trt_engine:
+            if prefill:
+                engine = self.prefill_engine
+                context = self.prefill_context
+            else:
+                engine = self.context_engine
+                context = self.context_context
+                trt_kv = self.stable_kv[:, :batch_size, :, :self.stable_kv_len, :].detach().clone()
+                self._set_tensor(engine, context, "past_key_values", trt_kv)
+            self._set_tensor(engine, context, "hidden_states", hidden_states)
+            self._set_tensor(engine, context, "inputs_embeds", inputs_embeds)
+            self._set_tensor(engine, context, "position_ids", position_ids)
+            self._set_tensor(engine, context, "out_hidden", hidden_states)
+            self._set_tensor(engine, context, "past_key_out", key_cache)
+            self._set_tensor(engine, context, "past_val_out", val_cache)
+            self._check_tensors(engine, context)
+            ok = context.execute_async_v3(self.cuda_stream)
+            if not ok:
+                raise RuntimeError(f"Executing TRT engine failed step={step}!")
+        else:
+            hidden_states, kv_cache = self(
+                hidden_states,
+                inputs_embeds=inputs_embeds,
+                past_key_values=self.stable_kv[:, :batch_size, :, :self.stable_kv_len, :],
+                position_ids=position_ids,
+                attention_mask=hidden_states,
+            )
+            key_cache, val_cache = kv_cache
+
+        # print("hidden_states", hidden_states.dtype)
+        # print("inputs_embeds", inputs_embeds.dtype)
+        # print("position_ids", position_ids.dtype)
+        # print("hidden_states", hidden_states.dtype)
+        # print("self.stable_kv_len", self.stable_kv_len)
+        # exit()
+
+        self.stable_kv[0, :batch_size, :, self.stable_kv_len:self.stable_kv_len+seq_length, :] = key_cache
+        self.stable_kv[1, :batch_size, :, self.stable_kv_len:self.stable_kv_len+seq_length, :] = val_cache
+        self.stable_kv_len += inputs_embeds.shape[1]
+        last_hidden = hidden_states[:, -1]
+        last_headout = head(last_hidden)
+
+        hidden_states = hidden_states[:, -1:]
+        for i in range(max_length-1):
+            input_ids = torch.argmax(last_headout, dim=-1).to(torch.int32)
+            ss_token.append(input_ids)
+            # 108704 is "文本"
+            # if (end_ids in ss_token) or (108704 in ss_token):
+            # if end_ids in ss_token:
+                # return (torch.cat(ss_token),None,None)
+
+            batch_size, seq_length, _ = hidden_states.shape
+            position_ids = torch.arange(
+                self.stable_kv_len,
+                self.stable_kv_len + seq_length,
+                dtype=torch.long,
+                device=hidden_states.device,
+            )
+            position_ids = position_ids.unsqueeze(0).view(-1, seq_length).detach().clone()
+
+            # torch.onnx.export(
+                # self,
+                # {
+                  # 'hidden_states': hidden_states,
+                  # 'input_ids': input_ids,
+                  # 'past_key_values': self.stable_kv[:, :batch_size, :, :self.stable_kv_len, :],
+                  # 'position_ids': position_ids,
+                # },
+                # "trt-mds/generate.onnx",
+                # input_names=["hidden_states", "input_ids", "past_key_values", "position_ids"], output_names=["out_hidden", "past_key_out", "past_val_out"],
+                # dynamic_axes={
+                    # "past_key_values": {3: "seq_len"},
+                # }
+            # )
+            # exit()
+
+            if self.trt_engine:
+                trt_kv = self.stable_kv[:, :batch_size, :, :self.stable_kv_len, :].detach().clone()
+                self._set_tensor(self.engine, self.context, "hidden_states", hidden_states)
+                self._set_tensor(self.engine, self.context, "input_ids", input_ids)
+                self._set_tensor(self.engine, self.context, "past_key_values", trt_kv)
+                self._set_tensor(self.engine, self.context, "position_ids", position_ids)
+                self._set_tensor(self.engine, self.context, "out_hidden", hidden_states)
+                self._check_tensors(self.engine, self.context)
+                ok = self.context.execute_async_v3(self.cuda_stream)
+                if not ok:
+                    raise RuntimeError(f"Executing TRT engine failed step={step}!")
+            else:
+                hidden_states, kv_cache = self(
+                    hidden_states,
+                    input_ids=input_ids,
+                    past_key_values=self.stable_kv[:, :batch_size, :, :self.stable_kv_len, :],
+                    position_ids=position_ids,
+                    head=head,
+                )
+                self.trt_k_out, self.trt_v_out = kv_cache
+
+            self.stable_kv[0, :batch_size, :, self.stable_kv_len:self.stable_kv_len+seq_length, :] = self.trt_k_out
+            self.stable_kv[1, :batch_size, :, self.stable_kv_len:self.stable_kv_len+seq_length, :] = self.trt_v_out
+            # print("self.stable_kv", self.stable_kv)
+            # print("out_hidden", hidden_states)
+            self.stable_kv_len += hidden_states.shape[1]
+            last_headout = head(hidden_states[0])
+
+        # self.torch_stream.synchronize()
+        end = time.time()
+        self.eagle_gen_time += end - start
+        # print("eagle_gen_time", self.eagle_gen_time)
+        self.eagle_gen_time = 0.
         input_ids = torch.argmax(last_headout, dim=-1).to(torch.int32)
         ss_token.append(input_ids)
 

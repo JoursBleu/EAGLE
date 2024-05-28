@@ -20,7 +20,7 @@ from mind_ad.constants import IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM
 from mind_ad.model.builder import load_pretrained_model
 from mind_ad.eval.eval_llava import create_data_loader
 # from llava.train.train import DataArguments, LazySupervisedDataset
-from llava.model import LlavaQwenForCausalLM
+from mind_ad.model import LlavaQwenForCausalLM
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer,BitsAndBytesConfig
 from datasets import load_dataset
@@ -28,7 +28,7 @@ import json
 from fastchat.model.model_adapter import get_conversation_template
 
 # bigname="/lpai/volumes/cloudmodel-muses/lt/models/llava_qwen4b_sft_v4.5"
-bigname="/mnt/volumes/cloudmodel-muses/lt/models/wdf-llava-pretrain-ckpts-24-05-03-02"
+bigname="/mnt/volumes/cloudmodel-muses/lt/models/llava_qwen1.8b_siglip384_960_cdp320_task_sft_v0.6.0_bus_0"
 # bigname = "/home/lyh/weights/hf/llama/7B/"
 # smallname = "/home/lyh/weights/hf/llama/7B/"
 data_file = args.data_file
@@ -178,7 +178,7 @@ def build_dataset_rank(
 with open(data_file, 'r') as f:
     questions = json.load(f)
     length = len(questions)
-    length = length if length < 60000 else 60000
+    length = length if length < 120000 else 120000
     start = int((length-1.) * float(args.gpu_index) / args.gpu_num)
     end = int((length-1.) * (args.gpu_index+1.) / args.gpu_num)
     questions = questions[start: end]
