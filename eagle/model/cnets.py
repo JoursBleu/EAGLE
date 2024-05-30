@@ -312,7 +312,7 @@ class LlamaAttention(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
+        attention_mask: bool = False,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
         output_attentions: bool = False,
@@ -347,10 +347,10 @@ class LlamaAttention(nn.Module):
         attn_weights = torch.matmul(query_states, key_states_.transpose(2, 3)) / math.sqrt(self.head_dim)
 
         # attn_weights with shape [bs, head_num, new_seqlen, all_seqlen]
-        if attention_mask is not None:
-            attention_mask = torch.empty_like(attn_weights[0,0]).fill_(torch.finfo(attn_weights.dtype).min)
-            attention_mask = torch.triu(attention_mask, diagonal=(attn_weights.shape[3]-attn_weights.shape[2]+1))
-            attn_weights += attention_mask
+        if attention_mask:
+            attn_mask = torch.empty_like(attn_weights[0,0]).fill_(torch.finfo(attn_weights.dtype).min)
+            attn_mask = torch.triu(attn_mask, diagonal=(attn_weights.shape[3]-attn_weights.shape[2]+1))
+            attn_weights += attn_mask
 
         # upcast attention to fp32
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
@@ -430,7 +430,7 @@ class LlamaDecoderLayer(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
+        attention_mask: bool = False,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
         output_attentions: Optional[bool] = False,
@@ -625,7 +625,7 @@ class Model(nn.Module):
         inputs_embeds: Optional[torch.FloatTensor] = None,
         past_key_values: Optional[List[torch.FloatTensor]] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
+        attention_mask: bool = False,
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
@@ -635,10 +635,10 @@ class Model(nn.Module):
         if input_ids is not None:
             inputs_embeds = self.embed_tokens(input_ids).reshape(hidden_states.shape)
         hidden_states = self.fc(torch.cat((inputs_embeds, hidden_states), dim=-1))
-        print("cnet fc hidden_states", hidden_states)
+        # print("cnet fc hidden_states", hidden_states)
         layer_outputs = self.layers[0](
             hidden_states,
-            attention_mask=attention_mask,
+            attention_mask=(input_ids is None),
             position_ids=position_ids,
             past_key_value=past_key_values,
             output_attentions=output_attentions,
@@ -646,10 +646,10 @@ class Model(nn.Module):
         )
         hidden_states, kv_cache = layer_outputs
 
-        print("cnet decode hidden_states", hidden_states)
+        # print("cnet decode hidden_states", hidden_states)
         # hidden_states = self.fc_back(hidden_states[:,-1:])
 
-        return hidden_states, kv_cache
+        return hidden_states[:,-1:], kv_cache
 
     @torch.no_grad()
     def generate(self,hidden_states,input_ids,head,max_length=4,use_cache=False):
@@ -700,12 +700,6 @@ class Model(nn.Module):
             newkv.append((i[0][:numr],i[1][:numr]))
         return tuple(newkv)
 
-
-    def reset_kv(self, new_len: int=0):
-        self.stable_kv_len = new_len
-
-    def revert_kv(self, revert_len: int=0):
-        self.stable_kv_len -= revert_len
 
     @torch.no_grad()
     def repeat_hidden(self,hidden_state,repeat_num):
@@ -790,9 +784,16 @@ class Model(nn.Module):
             # print("tensor_name", name)
             # print("ptr", ptr)
 
+    def reset_kv(self, new_len: int=0):
+        self.stable_kv_len = new_len
+
+    def revert_kv(self, revert_len: int=0):
+        self.stable_kv_len -= revert_len
+
     @torch.no_grad()
-    def topOne_genrate(self, hidden_states, inputs_embeds, head, logits_processor, max_length=10, prefill=False, end_ids=None):
-        ss_token = []
+    def topOne_genrate(self, hidden_states, inputs_embeds, head, logits_processor, max_length=10, prefill=False, end_ids=None, fake_draft_tensor=None):
+        # ss_token = fake_draft_tensor
+        ss_token = [fake_draft_tensor]
         # self.reset()
         # print("self.stable_kv_len", self.stable_kv_len)
         # print("hidden_states", hidden_states)
@@ -815,13 +816,12 @@ class Model(nn.Module):
                   # 'inputs_embeds': inputs_embeds,
                   # 'position_ids': position_ids,
                 # },
-                # "trt-mds/prefill.onnx",
+                # "trt-eagle/prefill.onnx",
                 # input_names=["hidden_states", "inputs_embeds", "position_ids"], output_names=["out_hidden", "past_key_out", "past_val_out"],
                 # dynamic_axes={
                     # "hidden_states": {1: "seq_len"},
                     # 'inputs_embeds': {1: "seq_len"},
                     # "position_ids": {1: "seq_len"},
-                    # "out_hidden": {1: "seq_len"},
                     # "past_key_out": {2: "seq_len"},
                     # "past_val_out": {2: "seq_len"},
                 # }
@@ -836,28 +836,28 @@ class Model(nn.Module):
                   # 'past_key_values': self.stable_kv[:, :batch_size, :, :self.stable_kv_len, :],
                   # 'position_ids': position_ids,
                 # },
-                # "trt-mds/context.onnx",
+                # "trt-eagle/context.onnx",
                 # input_names=["hidden_states", "inputs_embeds", "past_key_values", "position_ids"], output_names=["out_hidden", "past_key_out", "past_val_out"],
                 # dynamic_axes={
                     # "hidden_states": {1: "seq_len"},
                     # 'inputs_embeds': {1: "seq_len"},
                     # "past_key_values": {3: "base_seq_len"},
                     # "position_ids": {1: "seq_len"},
-                    # "out_hidden": {1: "seq_len"},
                     # "past_key_out": {2: "seq_len"},
                     # "past_val_out": {2: "seq_len"},
                 # }
             # )
             # exit()
 
-        key_cache = torch.empty((1, self.num_key_value_heads, hidden_states.shape[1], self.hidden_size // self.num_key_value_heads),
-                                device=hidden_states.device, dtype=hidden_states.dtype)
-        val_cache = torch.empty((1, self.num_key_value_heads, hidden_states.shape[1], self.hidden_size // self.num_key_value_heads),
-                                device=hidden_states.device, dtype=hidden_states.dtype)
-
         # self.torch_stream.synchronize()
         start = time.time()
         if self.trt_engine:
+            key_cache = torch.empty((1, self.num_key_value_heads, hidden_states.shape[1],
+                                    self.hidden_size // self.num_key_value_heads),
+                                    device=hidden_states.device, dtype=hidden_states.dtype)
+            val_cache = torch.empty((1, self.num_key_value_heads, hidden_states.shape[1],
+                                    self.hidden_size // self.num_key_value_heads),
+                                    device=hidden_states.device, dtype=hidden_states.dtype)
             if prefill:
                 engine = self.prefill_engine
                 context = self.prefill_context
@@ -880,13 +880,13 @@ class Model(nn.Module):
             hidden_states, kv_cache = self(
                 hidden_states,
                 inputs_embeds=inputs_embeds,
-                past_key_values=self.stable_kv[:, :batch_size, :, :self.stable_kv_len, :],
+                past_key_values=None if prefill else self.stable_kv[:, :batch_size, :, :self.stable_kv_len, :],
                 position_ids=position_ids,
                 attention_mask=hidden_states,
             )
             key_cache, val_cache = kv_cache
 
-        # print("hidden_states", hidden_states.dtype)
+        # print("1 hidden_states", hidden_states)
         # print("inputs_embeds", inputs_embeds.dtype)
         # print("position_ids", position_ids.dtype)
         # print("hidden_states", hidden_states.dtype)
@@ -895,23 +895,28 @@ class Model(nn.Module):
 
         self.stable_kv[0, :batch_size, :, self.stable_kv_len:self.stable_kv_len+seq_length, :] = key_cache
         self.stable_kv[1, :batch_size, :, self.stable_kv_len:self.stable_kv_len+seq_length, :] = val_cache
-        self.stable_kv_len += inputs_embeds.shape[1]
-        last_hidden = hidden_states[:, -1]
-        last_headout = head(last_hidden)
+        self.stable_kv_len += seq_length
+        stable_kv_len_base = self.stable_kv_len
+        last_hidden = hidden_states[:, 0]
+        if self.use_small_head:
+            last_headout = self.small_head(last_hidden)
+        else:
+            last_headout = head(last_hidden)
 
-        hidden_states = hidden_states[:, -1:]
+        hidden_states = hidden_states[:, :1]
         for i in range(max_length-1):
             input_ids = torch.argmax(last_headout, dim=-1).to(torch.int32)
+            if self.use_small_head:
+                input_ids = self.indexes[input_ids]
+            # ss_token[:, i+1] = (input_ids)
             ss_token.append(input_ids)
-            # 108704 is "文本"
-            # if (end_ids in ss_token) or (108704 in ss_token):
-            # if end_ids in ss_token:
-                # return (torch.cat(ss_token),None,None)
+            # if end_ids in input_ids:
+                # return (ss_token,None,None)
 
             batch_size, seq_length, _ = hidden_states.shape
             position_ids = torch.arange(
-                self.stable_kv_len,
-                self.stable_kv_len + seq_length,
+                stable_kv_len_base,
+                stable_kv_len_base + 1,
                 dtype=torch.long,
                 device=hidden_states.device,
             )
@@ -922,10 +927,10 @@ class Model(nn.Module):
                 # {
                   # 'hidden_states': hidden_states,
                   # 'input_ids': input_ids,
-                  # 'past_key_values': self.stable_kv[:, :batch_size, :, :self.stable_kv_len, :],
+                  # 'past_key_values': self.stable_kv[:, :batch_size, :, :stable_kv_len_base, :],
                   # 'position_ids': position_ids,
                 # },
-                # "trt-mds/generate.onnx",
+                # "trt-eagle/generate.onnx",
                 # input_names=["hidden_states", "input_ids", "past_key_values", "position_ids"], output_names=["out_hidden", "past_key_out", "past_val_out"],
                 # dynamic_axes={
                     # "past_key_values": {3: "seq_len"},
@@ -934,7 +939,7 @@ class Model(nn.Module):
             # exit()
 
             if self.trt_engine:
-                trt_kv = self.stable_kv[:, :batch_size, :, :self.stable_kv_len, :].detach().clone()
+                trt_kv = self.stable_kv[:, :batch_size, :, :stable_kv_len_base, :].detach().clone()
                 self._set_tensor(self.engine, self.context, "hidden_states", hidden_states)
                 self._set_tensor(self.engine, self.context, "input_ids", input_ids)
                 self._set_tensor(self.engine, self.context, "past_key_values", trt_kv)
@@ -948,18 +953,20 @@ class Model(nn.Module):
                 hidden_states, kv_cache = self(
                     hidden_states,
                     input_ids=input_ids,
-                    past_key_values=self.stable_kv[:, :batch_size, :, :self.stable_kv_len, :],
+                    past_key_values=self.stable_kv[:, :batch_size, :, :stable_kv_len_base, :],
                     position_ids=position_ids,
-                    head=head,
                 )
                 self.trt_k_out, self.trt_v_out = kv_cache
 
-            self.stable_kv[0, :batch_size, :, self.stable_kv_len:self.stable_kv_len+seq_length, :] = self.trt_k_out
-            self.stable_kv[1, :batch_size, :, self.stable_kv_len:self.stable_kv_len+seq_length, :] = self.trt_v_out
+            self.stable_kv[0, :batch_size, :, stable_kv_len_base:stable_kv_len_base+seq_length, :] = self.trt_k_out
+            self.stable_kv[1, :batch_size, :, stable_kv_len_base:stable_kv_len_base+seq_length, :] = self.trt_v_out
             # print("self.stable_kv", self.stable_kv)
             # print("out_hidden", hidden_states)
-            self.stable_kv_len += hidden_states.shape[1]
-            last_headout = head(hidden_states[0])
+            stable_kv_len_base += 1
+            if self.use_small_head:
+                last_headout = self.small_head(hidden_states[:, -1])
+            else:
+                last_headout = head(hidden_states[:, -1])
 
         # self.torch_stream.synchronize()
         end = time.time()
@@ -967,9 +974,12 @@ class Model(nn.Module):
         # print("eagle_gen_time", self.eagle_gen_time)
         self.eagle_gen_time = 0.
         input_ids = torch.argmax(last_headout, dim=-1).to(torch.int32)
+        if self.use_small_head:
+            input_ids = self.indexes[input_ids]
+        # ss_token[:, i+2] = (input_ids)
         ss_token.append(input_ids)
 
-        return (torch.cat(ss_token),None,None)
+        return torch.concat(ss_token, dim=-1),None,None
 
 
     @torch.no_grad()
