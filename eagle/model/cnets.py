@@ -701,6 +701,12 @@ class Model(nn.Module):
         return tuple(newkv)
 
 
+    def reset_kv(self, new_len: int=0):
+        self.stable_kv_len = new_len
+
+    def revert_kv(self, revert_len: int=0):
+        self.stable_kv_len -= revert_len
+
     @torch.no_grad()
     def repeat_hidden(self,hidden_state,repeat_num):
         new_hidden=[]
@@ -784,16 +790,9 @@ class Model(nn.Module):
             # print("tensor_name", name)
             # print("ptr", ptr)
 
-    def reset_kv(self, new_len: int=0):
-        self.stable_kv_len = new_len
-
-    def revert_kv(self, revert_len: int=0):
-        self.stable_kv_len -= revert_len
-
     @torch.no_grad()
-    def topOne_genrate(self, hidden_states, inputs_embeds, head, logits_processor, max_length=10, prefill=False, end_ids=None, fake_draft_tensor=None):
-        # ss_token = fake_draft_tensor
-        ss_token = [fake_draft_tensor]
+    def topOne_genrate(self, hidden_states, inputs_embeds, head, logits_processor, max_length=10, prefill=False, end_ids=None):
+        ss_token = []
         # self.reset()
         # print("self.stable_kv_len", self.stable_kv_len)
         # print("hidden_states", hidden_states)
@@ -896,7 +895,6 @@ class Model(nn.Module):
         self.stable_kv[0, :batch_size, :, self.stable_kv_len:self.stable_kv_len+seq_length, :] = key_cache
         self.stable_kv[1, :batch_size, :, self.stable_kv_len:self.stable_kv_len+seq_length, :] = val_cache
         self.stable_kv_len += seq_length
-        stable_kv_len_base = self.stable_kv_len
         last_hidden = hidden_states[:, 0]
         if self.use_small_head:
             last_headout = self.small_head(last_hidden)
@@ -908,15 +906,16 @@ class Model(nn.Module):
             input_ids = torch.argmax(last_headout, dim=-1).to(torch.int32)
             if self.use_small_head:
                 input_ids = self.indexes[input_ids]
-            # ss_token[:, i+1] = (input_ids)
             ss_token.append(input_ids)
-            # if end_ids in input_ids:
-                # return (ss_token,None,None)
+            # 108704 is "文本"
+            # if (end_ids in ss_token) or (108704 in ss_token):
+            # if end_ids in ss_token:
+                # return (torch.cat(ss_token),None,None)
 
             batch_size, seq_length, _ = hidden_states.shape
             position_ids = torch.arange(
-                stable_kv_len_base,
-                stable_kv_len_base + 1,
+                self.stable_kv_len,
+                self.stable_kv_len + seq_length,
                 dtype=torch.long,
                 device=hidden_states.device,
             )
@@ -927,7 +926,7 @@ class Model(nn.Module):
                 # {
                   # 'hidden_states': hidden_states,
                   # 'input_ids': input_ids,
-                  # 'past_key_values': self.stable_kv[:, :batch_size, :, :stable_kv_len_base, :],
+                  # 'past_key_values': self.stable_kv[:, :batch_size, :, :self.stable_kv_len, :],
                   # 'position_ids': position_ids,
                 # },
                 # "trt-eagle/generate.onnx",
@@ -939,7 +938,7 @@ class Model(nn.Module):
             # exit()
 
             if self.trt_engine:
-                trt_kv = self.stable_kv[:, :batch_size, :, :stable_kv_len_base, :].detach().clone()
+                trt_kv = self.stable_kv[:, :batch_size, :, :self.stable_kv_len, :].detach().clone()
                 self._set_tensor(self.engine, self.context, "hidden_states", hidden_states)
                 self._set_tensor(self.engine, self.context, "input_ids", input_ids)
                 self._set_tensor(self.engine, self.context, "past_key_values", trt_kv)
@@ -953,16 +952,16 @@ class Model(nn.Module):
                 hidden_states, kv_cache = self(
                     hidden_states,
                     input_ids=input_ids,
-                    past_key_values=self.stable_kv[:, :batch_size, :, :stable_kv_len_base, :],
+                    past_key_values=self.stable_kv[:, :batch_size, :, :self.stable_kv_len, :],
                     position_ids=position_ids,
                 )
                 self.trt_k_out, self.trt_v_out = kv_cache
 
-            self.stable_kv[0, :batch_size, :, stable_kv_len_base:stable_kv_len_base+seq_length, :] = self.trt_k_out
-            self.stable_kv[1, :batch_size, :, stable_kv_len_base:stable_kv_len_base+seq_length, :] = self.trt_v_out
+            self.stable_kv[0, :batch_size, :, self.stable_kv_len:self.stable_kv_len+seq_length, :] = self.trt_k_out
+            self.stable_kv[1, :batch_size, :, self.stable_kv_len:self.stable_kv_len+seq_length, :] = self.trt_v_out
             # print("self.stable_kv", self.stable_kv)
             # print("out_hidden", hidden_states)
-            stable_kv_len_base += 1
+            self.stable_kv_len += 1
             if self.use_small_head:
                 last_headout = self.small_head(hidden_states[:, -1])
             else:
@@ -976,10 +975,9 @@ class Model(nn.Module):
         input_ids = torch.argmax(last_headout, dim=-1).to(torch.int32)
         if self.use_small_head:
             input_ids = self.indexes[input_ids]
-        # ss_token[:, i+2] = (input_ids)
         ss_token.append(input_ids)
 
-        return torch.concat(ss_token, dim=-1),None,None
+        return (torch.cat(ss_token),None,None)
 
 
     @torch.no_grad()
