@@ -469,7 +469,7 @@ def len_list(x, n):
 
 
 class Model(nn.Module):
-    def __init__(self, config, load_emb=False, path=None, bias=True, total_tokens=63, depth=5, top_k=8, threshold=1.0):
+    def __init__(self, config, load_emb=False, path=None, bias=True, total_tokens=63, depth=5, top_k=8, threshold=1.0, load_checkpoint=None, training=None):
         super().__init__()
 
         self.gradient_checkpointing = True
@@ -502,10 +502,10 @@ class Model(nn.Module):
         self.total_tokens = total_tokens - 1
         self.depth = depth
         self.threshold = math.log(threshold)
-        # print("total_tokens",total_tokens)
-        # print("depth",depth)
-        # print("top_k",top_k)
-        # print("threshold",threshold)
+        print("total_tokens",total_tokens)
+        print("depth",depth)
+        print("top_k",top_k)
+        print("threshold",threshold)
 
         self.layers = nn.ModuleList([LlamaDecoderLayer(config, index) for index in range(config.num_hidden_layers)])
         self.fc = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=bias)
@@ -513,6 +513,11 @@ class Model(nn.Module):
         self.logsoftmax = nn.LogSoftmax(dim=-1)
         for param in self.embed_tokens.parameters():
             param.requires_grad = False
+
+        if load_checkpoint:
+            ea_layer_state_dict = torch.load(load_checkpoint, map_location="cuda")
+            self.load_state_dict(ea_layer_state_dict, strict=True)
+
 
     def init_tree(self):
         self.tree_mask_init = torch.eye(self.top_k, device=self.embed_tokens.weight.device)[None, None]
@@ -557,7 +562,7 @@ class Model(nn.Module):
     def forward(
             self,
             hidden_states,
-            input_ids,
+            input_ids=None,
             attention_mask: Optional[torch.Tensor] = None,
             position_ids: Optional[torch.LongTensor] = None,
             past_key_values: Optional[List[torch.FloatTensor]] = None,
@@ -572,14 +577,18 @@ class Model(nn.Module):
         seq_length_with_past = seq_length
         past_key_values_length = 0
 
-        with torch.no_grad():
-            inputs_embeds = self.embed_tokens(input_ids)
-            # inputs_embeds = inputs_embeds.detach()
+        # with torch.no_grad():
+            # inputs_embeds = self.embed_tokens(input_ids)
+            # # inputs_embeds = inputs_embeds.detach()
+        if (inputs_embeds is None):
+            with torch.no_grad():
+                inputs_embeds = self.embed_tokens(input_ids)
 
         # if std is not None:
         #     noise = torch.randn(inputs_embeds.size(),device=inputs_embeds.device) * std
         #     inputs_embeds=inputs_embeds+noise
 
+        # breakpoint()
         if past_key_values is not None:
             past_key_values_length = past_key_values[0][0].shape[2]
             seq_length_with_past = seq_length_with_past + past_key_values_length
@@ -592,6 +601,7 @@ class Model(nn.Module):
         else:
             position_ids = position_ids.view(-1, seq_length).long()
 
+        # breakpoint()
         #position_ids=position_ids//4
         if attention_mask is None:
             attention_mask = torch.ones(
@@ -607,11 +617,12 @@ class Model(nn.Module):
 
         # hidden_states=self.act(self.fc(torch.cat((inputs_embeds,hidden_states),dim=-1)))
         inputs_embeds = inputs_embeds.to(hidden_states.dtype)
+        # breakpoint()
         hidden_states = self.fc(torch.cat((inputs_embeds, hidden_states), dim=-1))
 
         all_hidden_states = () if output_hidden_states else None
         next_decoder_cache = () if use_cache else None
-
+        # breakpoint()
         for idx, decoder_layer in enumerate(self.layers):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
@@ -645,6 +656,7 @@ class Model(nn.Module):
 
             hidden_states = layer_outputs[0]
 
+            # breakpoint()
             if use_cache:
                 next_decoder_cache += (layer_outputs[2 if output_attentions else 1],)
 
@@ -657,7 +669,42 @@ class Model(nn.Module):
         self.stable_kv = None
 
     @torch.no_grad()
-    def topK_genrate(self, hidden_states, input_ids, head, logits_processor):
+    def topOne_genrate(self, hidden_states, inputs_embeds, head, logits_processor, end_ids=None):
+        inputs_embeds = inputs_embeds[:, 1:]
+        inputs_embeds = inputs_embeds.to(hidden_states.device)
+        ss_token = []
+        # self.reset()
+        # print("self.stable_kv_len", self.stable_kv_len)
+        # print("hidden_states", hidden_states.shape)
+        # print("inputs_embeds", inputs_embeds.shape)
+        if hasattr(self, "stable_kv") and self.stable_kv is not None:
+            kv_len = self.stable_kv[0][0].shape[2]
+            out_hidden, past_key_values = self(hidden_states, inputs_embeds=inputs_embeds[:, kv_len:],
+                                               past_key_values=self.stable_kv, use_cache=True)
+        else:
+            out_hidden, past_key_values = self(hidden_states,
+                                               inputs_embeds=inputs_embeds,
+                                               use_cache=True)
+        hidden_states = out_hidden[:, -1:]
+        last_headout = head(hidden_states)
+        self.stable_kv = past_key_values
+
+        for i in range(self.depth):
+            input_ids = torch.argmax(last_headout, dim=-1).to(torch.int32)
+
+            ss_token.append(input_ids)
+            out_hidden, past_key_values = self(hidden_states, input_ids=input_ids, past_key_values=past_key_values, use_cache=True)
+            hidden_states = out_hidden[:, -1:]
+            last_headout = head(hidden_states)
+
+        input_ids = torch.argmax(last_headout, dim=-1).to(torch.int32)
+        ss_token.append(input_ids)
+
+        return (torch.cat(ss_token, dim=1),None,None)
+
+
+    @torch.no_grad()
+    def topK_genrate(self, hidden_states, input_ids, head, logits_processor, input_embedding=None):
 
         input_ids = input_ids.to(hidden_states.device)
         total_tokens = self.total_tokens
@@ -670,19 +717,23 @@ class Model(nn.Module):
         parents_list = []
         ss_token = []
 
-        input_ids = input_ids[:, 1:]
-        input_ids = input_ids.to(hidden_states.device)
+        if input_embedding is not None:
+            input_embedding = input_embedding[:, 1:]
+            input_embedding = input_embedding.to(hidden_states.device)
 
-        len_posi = input_ids.shape[1]
+        len_posi = input_embedding.shape[1]
         self.reset()
 
+        # breakpoint()
         # with Timer("draft many"):
         if hasattr(self, "stable_kv") and self.stable_kv is not None:
             kv_len = self.stable_kv[0][0].shape[2]
-            out_hidden, past_key_values = self(hidden_states, input_ids=input_ids[:, kv_len:],
+            out_hidden, past_key_values = self(hidden_states, inputs_embeds=input_embedding[:, kv_len:],
                                                past_key_values=self.stable_kv, use_cache=True)
         else:
-            out_hidden, past_key_values = self(hidden_states, input_ids=input_ids, use_cache=True)
+            out_hidden, past_key_values = self(hidden_states,
+                                               inputs_embeds=input_embedding,
+                                               use_cache=True)
         self.stable_kv = past_key_values
         last_hidden = out_hidden[:, -1]
 
@@ -702,6 +753,7 @@ class Model(nn.Module):
 
         # 4
         for i in range(depth):
+            # breakpoint()
             self.tree_mask = tree_mask
             position_ids = len_posi + self.position_ids
             # with Timer("draft one"):
